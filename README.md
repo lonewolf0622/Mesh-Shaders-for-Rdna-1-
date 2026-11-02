@@ -20,6 +20,13 @@ example for one game:
 RADV_DIRECTMESH=0 %command%
 ```
 
+**RDNA 1 (Navi 10/12/14, e.g. RX 5500/5600/5700):** D3D12 games also need vkd3d-proton to expose feature level 12_2,
+or they will not use Mesh shaders. Add this to the game's Steam launch options:
+
+```
+VKD3D_FEATURE_LEVEL=12_2 %command%
+```
+
 **v1.3.1:** fixes GPU hangs at 4K output (the index route's storage no longer competes for the BC-250's 512 MiB of
 VRAM) and turns DirectMesh on by default on a BC-250.
 
@@ -128,6 +135,13 @@ On BC-250 and RDNA 1, the driver enables DirectMesh automatically. `RADV_DIRECTM
 `RADV_DIRECTMESH=1` remains an explicit override. Individual `RADV_BC250_*` / `BC250_*` options still take priority.
 BC-250's indexed storage stays in write-combined GTT, preserving v1.3.1's 4K fix. Discrete RDNA 1 keeps that storage
 in local VRAM. Installed drivers are not changed by building this tree.
+
+On RDNA 1 cards, add `VKD3D_FEATURE_LEVEL=12_2` to D3D12 games so vkd3d-proton reports feature level 12_2 and the game
+turns on Mesh shaders. Combined with the build-folder ICD:
+
+```
+VKD3D_FEATURE_LEVEL=12_2 VK_DRIVER_FILES=/path/to/bc250meshtaskwork/build/src/amd/vulkan/radeon_devenv_icd.x86_64.json %command%
+```
 
 Useful extras:
 
