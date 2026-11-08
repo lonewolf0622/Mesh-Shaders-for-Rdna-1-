@@ -19,7 +19,10 @@ int main(int argc,char**argv){
  const char*ext="VK_EXT_mesh_shader";
  VkDeviceCreateInfo dci={VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO,&f13,0,1,&q,0,0,1,&ext,&feat};
  VkResult r=vkCreateDevice(pd,&dci,0,&dev);if(r){printf("DEVICE %d\n",r);return 2;}
- VkPipelineLayoutCreateInfo plci={VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};VkPipelineLayout lay;vkCreatePipelineLayout(dev,&plci,0,&lay);
+ /* One storage buffer at set 0 binding 0 for the fixtures that write one (unused by the others). */
+ VkDescriptorSetLayoutBinding sb={0,VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,1,VK_SHADER_STAGE_TASK_BIT_EXT|VK_SHADER_STAGE_MESH_BIT_EXT|VK_SHADER_STAGE_FRAGMENT_BIT,0};
+ VkDescriptorSetLayoutCreateInfo slci={VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO,0,0,1,&sb};VkDescriptorSetLayout sl;vkCreateDescriptorSetLayout(dev,&slci,0,&sl);
+ VkPipelineLayoutCreateInfo plci={VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO,0,0,1,&sl};VkPipelineLayout lay;vkCreatePipelineLayout(dev,&plci,0,&lay);
  VkPipelineShaderStageCreateInfo st[3]={{VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,0,0,VK_SHADER_STAGE_MESH_BIT_EXT,sm(mesh),"main"},
   {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,0,0,VK_SHADER_STAGE_FRAGMENT_BIT,sm(frag),"main"}};
  if(task)st[2]=(VkPipelineShaderStageCreateInfo){VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,0,0,VK_SHADER_STAGE_TASK_BIT_EXT,sm(task),"main"};

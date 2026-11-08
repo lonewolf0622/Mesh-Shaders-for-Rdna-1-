@@ -5396,7 +5396,8 @@ bc250_idx_eligible(nir_shader *mesh, nir_shader *fs, bool task, const char **why
    const unsigned threads = contract.workgroup_invocations;
    *why = NULL;
    if (contract.primitive_type != MESA_PRIM_TRIANGLES) { *why = "not triangles"; return false; }
-   if (contract.workgroup_size[1] != 1 || contract.workgroup_size[2] != 1) { *why = "2D/3D workgroup"; return false; }
+   /* The Task index route's pass is a compute shader with the Mesh workgroup's own shape. */
+   if ((contract.workgroup_size[1] != 1 || contract.workgroup_size[2] != 1) && !task) { *why = "2D/3D workgroup"; return false; }
    /* The Task index route reads the hybrid producer's payload records (radv_bc250_idx_build_task_cs). */
    if (contract.task_payload_size && !task) { *why = "task payload"; return false; }
    if (contract.max_vertices > 256 || contract.max_primitives > 256 || !threads) { *why = "size"; return false; }
@@ -5411,7 +5412,9 @@ bc250_idx_eligible(nir_shader *mesh, nir_shader *fs, bool task, const char **why
        fs->info.inputs_read & (VARYING_BIT_PRIMITIVE_ID | VARYING_BIT_LAYER | VARYING_BIT_VIEWPORT)) {
       *why = "fragment reads primitive-level data"; return false;
    }
-   const uint64_t primitive_builtins = BITFIELD64_MASK(VARYING_SLOT_VAR0) & ~VARYING_BIT_PRIMITIVE_INDICES;
+   /* The Task index route stages CullPrimitive and makes culled primitives degenerate. */
+   const uint64_t primitive_builtins = BITFIELD64_MASK(VARYING_SLOT_VAR0) & ~VARYING_BIT_PRIMITIVE_INDICES &
+                                       ~(task ? VARYING_BIT_CULL_PRIMITIVE : 0);
    if (contract.declared_per_primitive_outputs & primitive_builtins) { *why = "primitive builtin output"; return false; }
    if (contract.non_array_output) { *why = "vertex output type"; return false; }
    if (!contract.triangle_index_array) { *why = "no triangle indices"; return false; }
@@ -5427,7 +5430,10 @@ bc250_idx_eligible(nir_shader *mesh, nir_shader *fs, bool task, const char **why
                break;
             case nir_intrinsic_load_deref: {
                nir_variable *var = nir_deref_instr_get_variable(nir_src_as_deref(in->src[0]));
-               if (!var || var->data.mode == nir_var_shader_out) { *why = "reads outputs"; return false; }
+               /* The Task index route reads stored outputs back (not the encoded index array). */
+               const bool readable = task && var && var->data.mode == nir_var_shader_out &&
+                                     var->data.location != VARYING_SLOT_PRIMITIVE_INDICES;
+               if ((!var || var->data.mode == nir_var_shader_out) && !readable) { *why = "reads outputs"; return false; }
                break;
             }
             case nir_intrinsic_store_deref: {
@@ -5435,7 +5441,8 @@ bc250_idx_eligible(nir_shader *mesh, nir_shader *fs, bool task, const char **why
                nir_variable *var = nir_deref_instr_get_variable(d);
                if (!var) { *why = "unknown store"; return false; }
                if (var->data.mode != nir_var_shader_out) {
-                  if (var->data.mode != nir_var_function_temp && var->data.mode != nir_var_mem_shared) {
+                  /* The Task index route runs every workgroup once (in exactly one pass), as the hardware would. */
+                  if (var->data.mode != nir_var_function_temp && var->data.mode != nir_var_mem_shared && !task) {
                      *why = "external memory side effect"; return false;
                   }
                   break;
@@ -5451,17 +5458,24 @@ bc250_idx_eligible(nir_shader *mesh, nir_shader *fs, bool task, const char **why
                }
                /* Separate compute/vertex executions cannot preserve loads around external writes.
                 * Shared stores and atomics remain workgroup-local in the index pass. */
-               if ((strstr(name, "store") || strstr(name, "atomic")) && !strstr(name, "shared")) {
+               if ((strstr(name, "store") || strstr(name, "atomic")) && !strstr(name, "shared") && !task) {
                   *why = "external memory side effect"; return false;
                }
-               if (!strcmp(name, "load_num_workgroups")) { *why = name; return false; }
+               /* The Task index route takes NumWorkGroups from the record. */
+               if (!strcmp(name, "load_num_workgroups") && !task) { *why = name; return false; }
                break;
             }
             }
          }
       }
    }
-   if (contract.output_store_refusal) { *why = contract.output_store_refusal; return false; }
+   /* Lane ownership matters when the vertex shader replays the Mesh body; the Task index route always stores
+    * outputs at the slots the shader writes. */
+   if (contract.output_store_refusal &&
+       !(task && !strcmp(contract.output_store_refusal, "vertex store not owned by invocation % workgroup size"))) {
+      *why = contract.output_store_refusal;
+      return false;
+   }
    if (contract.allocation_static_sites != 1) {
       radv_bc250_analyze_mesh_allocation(mesh, &contract);
       if (!radv_bc250_mesh_allocation_is_canonical(&contract)) {
@@ -7818,6 +7832,20 @@ bc250_idx_create(struct radv_device *device, struct radv_graphics_pipeline *pipe
             fprintf(stderr, "BC250 MESH AUTO: Mesh (modeled small outputs)\n");
          goto out;
       }
+   }
+   if (task) {
+      /* CullPrimitive stays in the index pass as shared memory (radv_bc250_idx_build_task_cs): never stored,
+       * never fetched by the vertex shader. */
+      bool staged = false;
+      nir_foreach_shader_out_variable (v, mesh) {
+         if (v->data.location == VARYING_SLOT_CULL_PRIMITIVE) {
+            v->data.mode = nir_var_mem_shared;
+            v->data.per_primitive = false;
+            staged = true;
+         }
+      }
+      if (staged)
+         nir_fixup_deref_modes(mesh);
    }
    if (stored) {
       if (debug_get_bool_option("RADV_BC250_MESH_IDXPASS_PRUNE", true) &&

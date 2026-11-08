@@ -103,7 +103,12 @@ dedup_task128_wide_np_idx|dedup_task128_wide_np|t|RADV_BC250_MESH_TASK_IDX=1|0|B
 # Mesh body once per workgroup in a compute shader: full LDS, shared atomics keep their meaning)
 dedup_task64_wide_idx|dedup_task64_wide|t|RADV_BC250_MESH_TASK_IDX=1|0|BC250 TASK IDX: applied
 dedup_task128_wide_idx|dedup_task128_wide|t|RADV_BC250_MESH_TASK_IDX=1|0|BC250 TASK IDX: applied
-# the index route also needs lane-owned output stores: compaction stays refused
-compact_task128_idx|compact_task128|t|RADV_BC250_MESH_TASK_IDX=1|-8|BC250 TASK IDX: declined (vertex store not owned
+# the Task index route stores outputs at the slots the shader writes: compaction is admitted
+compact_task128_idx|compact_task128|t|RADV_BC250_MESH_TASK_IDX=1|0|BC250 TASK IDX: applied
+# Task index route features (forced on shapes the Mesh route also takes)
+feat_2d_task|feat_2d_task|t|RADV_BC250_MESH_TASK_IDX=force|0|BC250 TASK IDX: applied
+feat_ssbo_task|feat_ssbo_task|t|RADV_BC250_MESH_TASK_IDX=force|0|BC250 TASK IDX: applied
+feat_cull_task|feat_cull_task|t|RADV_BC250_MESH_TASK_IDX=force|0|BC250 TASK IDX: applied
+feat_numwg_task|feat_numwg_task|t|RADV_BC250_MESH_TASK_IDX=force|0|BC250 TASK IDX: applied
 EOF
 exit $fail

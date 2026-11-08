@@ -681,3 +681,136 @@ TEST_F(radv_bc250_idx_test, fetch_preserves_clip_cull_lengths)
    EXPECT_EQ(vs->info.cull_distance_array_size, 2u);
    ralloc_free(vs);
 }
+
+/* Task index route features the ordinary index route refuses: interpreted index pass and fetch shader.
+ * Invocations run one after another (shared atomics are sequential), so every check below only depends on
+ * values an invocation wrote itself or on that sequential order. */
+enum task_feature { TASK_COMPACT, TASK_CULL, TASK_READ_BACK, TASK_NUM_WORKGROUPS };
+
+static void
+task_feature_roundtrip(nir_builder *b, task_feature feature)
+{
+   const unsigned V = 64, P = 64, groups = 3;
+   b->shader->info.task_payload_size = 16;
+   nir_def *i = nir_load_local_invocation_index(b);
+   nir_def *g = nir_channel(b, nir_load_workgroup_id(b), 0);
+   nir_set_vertex_and_primitive_count(b, nir_imm_int(b, V), nir_imm_int(b, P), nir_imm_int(b, 0));
+   auto output = [&](const glsl_type *type, unsigned location, bool primitive, unsigned length) {
+      nir_variable *v = nir_variable_create(b->shader, nir_var_shader_out, glsl_array_type(type, length, 0), "out");
+      v->data.location = location;
+      v->data.per_primitive = primitive;
+      return v;
+   };
+   auto at = [&](nir_variable *v, nir_def *index) { return nir_build_deref_array(b, nir_build_deref_var(b, v), index); };
+   nir_variable *pos = output(glsl_uvec_type(4), VARYING_SLOT_POS, false, V);
+   nir_store_deref(b, at(pos, i), nir_vec4(b, nir_iadd(b, i, nir_imul_imm(b, g, 100)), i, g, nir_imm_int(b, 99)), 15);
+   nir_variable *var0 = output(glsl_uint_type(), VARYING_SLOT_VAR0, false, V);
+   nir_variable *pp = nullptr, *cull = nullptr;
+   nir_def *slot = i;
+   switch (feature) {
+   case TASK_COMPACT: {
+      /* Slots from a shared counter, reversed: not owned by the writing invocation. */
+      nir_variable *counter = nir_variable_create(b->shader, nir_var_mem_shared, glsl_uint_type(), "counter");
+      nir_def *ticket = nir_deref_atomic(b, 32, &nir_build_deref_var(b, counter)->def, nir_imm_int(b, 1),
+                                         .atomic_op = nir_atomic_op_iadd);
+      slot = nir_isub(b, nir_imm_int(b, P - 1), nir_umin_imm(b, ticket, P - 1));
+      pp = output(glsl_uint_type(), VARYING_SLOT_VAR0 + 2, true, P);
+      nir_store_deref(b, at(pp, slot), nir_iadd(b, nir_imul_imm(b, i, 11), g), 1);
+      nir_store_deref(b, at(var0, i), nir_imm_int(b, 7), 1);
+      break;
+   }
+   case TASK_CULL:
+      /* The route stages CullPrimitive in shared memory (radv_bc250_idx_create). */
+      cull = nir_variable_create(b->shader, nir_var_mem_shared, glsl_array_type(glsl_bool_type(), P, 0), "cull");
+      cull->data.location = VARYING_SLOT_CULL_PRIMITIVE;
+      nir_store_deref(b, at(cull, i), nir_ine_imm(b, nir_iand_imm(b, i, 1), 0), 1);
+      nir_store_deref(b, at(var0, i), nir_imm_int(b, 7), 1);
+      break;
+   case TASK_READ_BACK:
+      nir_store_deref(b, at(var0, i), nir_iadd_imm(b, nir_channel(b, nir_load_deref(b, at(pos, i)), 0), 5), 1);
+      break;
+   case TASK_NUM_WORKGROUPS:
+      nir_store_deref(b, at(var0, i), nir_channel(b, nir_load_num_workgroups(b), 0), 1);
+      break;
+   }
+   nir_variable *idx = output(glsl_uvec_type(3), VARYING_SLOT_PRIMITIVE_INDICES, true, P);
+   nir_store_deref(b, at(idx, slot),
+                   nir_vec3(b, i, nir_iand_imm(b, nir_iadd_imm(b, i, 1), 63), nir_iand_imm(b, nir_iadd_imm(b, i, 2), 63)), 7);
+   nir_shader_gather_info(b->shader, b->impl);
+
+   const bool has_pp = pp != nullptr;
+   const unsigned bytes = radv_bc250_idx_output_layout(b->shader);
+   ASSERT_NE(bytes, 0u);
+   nir_shader *cs = radv_bc250_idx_build_task_cs(b->shader, 0, bytes, NULL, 16);
+   nir_shader *vs = radv_bc250_idx_build_stored_vs(b->shader->options, b->shader, bytes);
+   nir_foreach_shader_out_variable (v, vs)
+      v->data.driver_location = v->data.location;
+   nir_lower_io(vs, nir_var_shader_out, glsl_count_attribute_slots, (nir_lower_io_options)0);
+   nir_remove_dead_derefs(vs);
+   nir_validate_shader(cs, "task feature producer");
+   nir_validate_shader(vs, "task feature fetch");
+   constexpr uint64_t ibva = 0x100000, dimsva = 0x300000, drawsva = 0x400000, tabva = 0x500000, payloadva = 0x600000;
+   const unsigned first = 101, vstride = has_pp ? V * (P + 1) : V;
+   std::vector<uint8_t> ib(first * 4 + groups * (P * 12 + bytes), 0xa5);
+   std::vector<uint32_t> dims = {0, 0, 0, groups, 1, 1}, draws = {0, 0, 0, 0, 0, groups * P * 3, 1, first, 0, groups};
+   std::vector<uint32_t> table = {2, groups, groups, 1, 1, 0, 0, 0, 0, 0, groups};
+   std::vector<uint32_t> payloads(8, 0);
+   bc250_dgc_nir_interpreter producer(cs), fetch(vs);
+   producer.mappings = {{ibva, ib.size(), ib.data()},
+                        {dimsva, dims.size() * 4, (uint8_t *)dims.data()},
+                        {drawsva, draws.size() * 4, (uint8_t *)draws.data()},
+                        {tabva, table.size() * 4, (uint8_t *)table.data()},
+                        {payloadva, payloads.size() * 4, (uint8_t *)payloads.data()}};
+   fetch.mappings = producer.mappings;
+   uint64_t constants[9] = {tabva, ibva, 64 * 12, 0, dimsva, drawsva, payloadva, 0, 0};
+   producer.push_constants.assign((uint8_t *)constants, (uint8_t *)(constants + 9));
+   fetch.push_constants = producer.push_constants;
+   fetch.draw_id = 1;
+   producer.num_workgroups = groups;
+   for (unsigned grp = 0; grp < groups; grp++) {
+      producer.shared_memory.assign(cs->info.shared_size, 0);
+      for (unsigned lane = 0; lane < 64; lane++)
+         producer.run(cs, grp, lane);
+      for (unsigned s = 0; s < P; s++) {
+         /* Which invocation wrote slot s. */
+         const unsigned writer = feature == TASK_COMPACT ? P - 1 - s : s;
+         for (unsigned c = 0; c < 3; c++) {
+            uint32_t k;
+            memcpy(&k, ib.data() + (first + grp * P * 3 + s * 3 + c) * 4, 4);
+            if (feature == TASK_CULL && (s & 1)) {
+               EXPECT_EQ(k, grp * vstride) << "culled primitive " << s << " not degenerate";
+               continue;
+            }
+            const unsigned v = (writer + c) % 64;
+            EXPECT_EQ(k, grp * vstride + v + (has_pp && c == 0 ? (s + 1) * 64 : 0));
+            fetch.vertex_id = k;
+            fetch.run(vs, 0, 0);
+            EXPECT_EQ(fetch.outputs[VARYING_SLOT_POS * 4], v + grp * 100);
+            const unsigned expected0 = feature == TASK_READ_BACK ? v + grp * 100 + 5 :
+                                       feature == TASK_NUM_WORKGROUPS ? groups : 7;
+            EXPECT_EQ(fetch.outputs[VARYING_SLOT_VAR0 * 4], expected0);
+            if (has_pp && c == 0)
+               EXPECT_EQ(fetch.outputs[(VARYING_SLOT_VAR0 + 2) * 4], writer * 11 + grp);
+         }
+      }
+   }
+   ralloc_free(vs);
+   ralloc_free(cs);
+}
+
+TEST_F(radv_bc250_idx_test, task_compacted_slots)
+{
+   task_feature_roundtrip(b, TASK_COMPACT);
+}
+TEST_F(radv_bc250_idx_test, task_cull_primitive)
+{
+   task_feature_roundtrip(b, TASK_CULL);
+}
+TEST_F(radv_bc250_idx_test, task_output_read_back)
+{
+   task_feature_roundtrip(b, TASK_READ_BACK);
+}
+TEST_F(radv_bc250_idx_test, task_num_workgroups)
+{
+   task_feature_roundtrip(b, TASK_NUM_WORKGROUPS);
+}

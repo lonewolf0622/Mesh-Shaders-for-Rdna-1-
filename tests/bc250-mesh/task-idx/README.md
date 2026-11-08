@@ -25,19 +25,29 @@ With `RADV_BC250_MESH_TASK_IDX=1`, such a pipeline is created as the Task index 
   pass skips every later one, so no pass reads a stale flag. N defaults to 16
   (`RADV_BC250_MESH_TASK_IDX_PASSES` overrides it). Records left after N passes are not drawn.
 
+Beyond the ordinary index route, the Task index route admits these, because it always stores outputs at the
+slots the shader writes and runs each Mesh workgroup exactly once (in exactly one pass), as the hardware would:
+
+- primitive compaction (output slots chosen through shared atomics, not owned by fixed invocations);
+- 2D/3D Mesh workgroups (the pass is a compute shader with the same shape);
+- `gl_CullPrimitiveEXT` (staged in the pass's shared memory; culled primitives become degenerate);
+- `gl_NumWorkGroups` (the record's Mesh grid);
+- storage buffer and image writes and external atomics.
+
+Reading back Mesh outputs is also handled, but valid SPIR-V never does it (VUID-StandaloneSpirv-MeshEXT-07107).
+
 Limits:
 
 - Indirect Task draws cover 16 producer chunks (65,536 Task workgroups per record). Groups beyond them
   are not drawn.
 - `SIMULTANEOUS_USE` command buffers and device-generated commands skip these draws, with one warning.
 - Pipeline statistics do not count the index pass as Mesh invocations.
-- Output stores must be owned by fixed invocations, as on the ordinary index route. Primitive compaction
-  through shared atomics stays refused.
-- Multiview stays refused.
+- Multiview, and fragment shaders reading PrimitiveID, Layer, Viewport or barycentrics, stay refused.
 
 Checks (all CPU, no GPU execution):
 
-- `radv_tests`: `task_payload_*` interprets the Task-mode index pass and the fetch vertex shader and
+- `radv_tests`: `task_compacted_slots`, `task_cull_primitive`, `task_output_read_back` and `task_num_workgroups`
+  interpret the pass with each feature. `task_payload_*` interprets the Task-mode index pass and the fetch vertex shader and
   checks every stored output, including the payload of the right record. `task_chain_*` runs the setup
   shader pass after pass and checks that every record is drawn exactly once, in order, with the pool
   restarted each pass.

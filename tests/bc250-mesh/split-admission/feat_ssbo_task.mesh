@@ -1,0 +1,16 @@
+#version 460
+#extension GL_EXT_mesh_shader : require
+// Task index route feature: the Mesh shader writes a storage buffer (runs once per workgroup, as on hardware).
+layout(local_size_x=128) in;
+layout(triangles, max_vertices=128, max_primitives=64) out;
+layout(location=0) perprimitiveEXT flat out vec4 pcol[];
+layout(set=0,binding=0,std430) buffer S { uint count; uint data[]; } s;
+struct P { uint base; }; taskPayloadSharedEXT P pl;
+void main(){
+ uint i=gl_LocalInvocationIndex;
+ SetMeshOutputsEXT(128,64);
+ s.data[(gl_WorkGroupID.x*128u+i)&1023u]=i+pl.base;
+ if(i==0u) atomicAdd(s.count,1u);
+ gl_MeshVerticesEXT[i].gl_Position=vec4(float(i%16u)/8.0-1.0,float(i/16u)/8.0-1.0,0.5,1);
+ if(i<64u){ gl_PrimitiveTriangleIndicesEXT[i]=uvec3(i,(i+1u)%128u,(i+2u)%128u); pcol[i]=vec4(1,0,1,1); }
+}

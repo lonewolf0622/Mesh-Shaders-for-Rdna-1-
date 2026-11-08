@@ -29,14 +29,20 @@ def spv(stage, path, name):
 
 task = spv('task', src / 't.task', 't.spv')
 rows = 0
-for fixture in ('dedup_task64_wide', 'dedup_task128_wide'):
+# fixture, fragment shader, RADV_BC250_MESH_TASK_IDX value ('force' on shapes the Mesh route also takes)
+FIXTURES = [('dedup_task64_wide', 'dedup_task64_wide', '1'), ('dedup_task128_wide', 'dedup_task128_wide', '1'),
+            # feat_ssbo_task needs a bound storage buffer, which index_gate does not provide: its pipeline creation is
+            # covered by ../split-admission/run.sh.
+            ('compact_task128', 'f', '1'), ('feat_2d_task', 'f', 'force'),
+            ('feat_cull_task', 'f', 'force'), ('feat_numwg_task', 'f', 'force')]
+for fixture, fragment, switch in FIXTURES:
     mesh = spv('mesh', src / (fixture + '.mesh'), fixture + '.spv')
-    frag = spv('frag', src / (fixture + '.frag'), fixture + '.frag.spv')
+    frag = spv('frag', src / (fragment + '.frag'), fragment + '.frag.spv')
     for mode in ('direct', 'count'):
         env = dict(PATH='/usr/bin', HOME='/tmp', LD_PRELOAD=str(a.shim.resolve()), AMDGPU_GPU_ID='gfx1013',
                    VK_DRIVER_FILES=str(icd), MESA_SHADER_CACHE_DISABLE='1', NIR_DEBUG='validate',
                    ACO_DEBUG='validateir,validatera', BC250_TRACE_COMPILE='1', BC250_IDX_TRACE='1',
-                   RADV_DEBUG='dumpibs', INDEX_PRIMITIVES='64', RADV_BC250_MESH_TASK_IDX='1')
+                   RADV_DEBUG='dumpibs', INDEX_PRIMITIVES='64', RADV_BC250_MESH_TASK_IDX=switch)
         if mode != 'direct':
             env['INDEX_INDIRECT'] = mode
         cmd = ['bwrap', '--ro-bind', '/', '/', '--dev', '/dev', '--proc', '/proc', '--tmpfs', '/tmp',

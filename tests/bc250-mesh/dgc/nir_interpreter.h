@@ -187,6 +187,29 @@ private:
          }
          break;
       }
+      case nir_intrinsic_shared_atomic:
+      case nir_intrinsic_shared_atomic_swap: {
+         /* Invocations run one after another, so atomics are sequential. */
+         const unsigned bytes = i->def.bit_size / 8;
+         const uint64_t off = src(i->src[0]) + nir_intrinsic_base(i);
+         check(bytes == 4 && off + 4 <= shared_memory.size(), "shared atomic out of bounds");
+         uint32_t old = 0;
+         memcpy(&old, shared_memory.data() + off, 4);
+         uint32_t value = old;
+         const uint32_t data = src(i->src[1]);
+         switch (nir_intrinsic_atomic_op(i)) {
+         case nir_atomic_op_iadd: value = old + data; break;
+         case nir_atomic_op_xchg: value = data; break;
+         case nir_atomic_op_umax: value = old > data ? old : data; break;
+         case nir_atomic_op_umin: value = old < data ? old : data; break;
+         case nir_atomic_op_ior: value = old | data; break;
+         case nir_atomic_op_cmpxchg: value = old == data ? (uint32_t)src(i->src[2]) : old; break;
+         default: check(false, "unsupported shared atomic");
+         }
+         memcpy(shared_memory.data() + off, &value, 4);
+         out[0] = old;
+         break;
+      }
       case nir_intrinsic_store_shared: {
          const unsigned bytes = i->src[0].ssa->bit_size / 8;
          const uint64_t off = src(i->src[1]) + nir_intrinsic_base(i);

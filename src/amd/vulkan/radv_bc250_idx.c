@@ -207,7 +207,8 @@ radv_bc250_idx_build_stored_vs(const nir_shader_compiler_options *options, const
  * search and runs as workgroup "flat - prefix[r]" of record r with DrawID r. */
 static void
 bc250_idx_indirect_prologue(nir_builder *b, unsigned V, unsigned P, nir_variable *wg_var, nir_variable *draw_var,
-                            nir_def **vbase, nir_def **ibase, unsigned output_bytes, nir_def **obase)
+                            nir_variable *nwg_var, nir_def **vbase, nir_def **ibase, unsigned output_bytes,
+                            nir_def **obase)
 {
    nir_def *tab = bc250_pointer(b, 0);
    nir_def *hdr = nir_load_global(b, 2, 32, tab, .align_mul = 4);
@@ -244,6 +245,9 @@ bc250_idx_indirect_prologue(nir_builder *b, unsigned V, unsigned P, nir_variable
    nir_def *dx = nir_channel(b, dims, 0), *dxy = nir_imul(b, dx, nir_channel(b, dims, 1));
    nir_store_var(b, wg_var, radv_bc250_dispatch_unflatten(b, local, dx, dxy), 7);
    nir_store_var(b, draw_var, r, 1);
+   /* Task index route: NumWorkGroups is the record's Mesh grid. */
+   if (nwg_var)
+      nir_store_var(b, nwg_var, dims, 7);
    nir_def *first = nir_load_global(
       b, 1, 32, nir_iadd(b, bc250_pointer(b, 40), nir_u2u64(b, nir_iadd_imm(b, nir_imul_imm(b, r, 20), 8))),
       .align_mul = 4);
@@ -272,9 +276,11 @@ bc250_idx_lower_task_payload(nir_shader *cs, nir_variable *draw_var, unsigned pa
             continue;
          nir_intrinsic_instr *in = nir_instr_as_intrinsic(instr);
          if (in->intrinsic == nir_intrinsic_barrier) {
+            /* Payload and outputs both live in global memory in the index pass. */
             const nir_variable_mode modes = nir_intrinsic_memory_modes(in);
-            if (modes & nir_var_mem_task_payload)
-               nir_intrinsic_set_memory_modes(in, (modes & ~nir_var_mem_task_payload) | nir_var_mem_global);
+            if (modes & (nir_var_mem_task_payload | nir_var_shader_out))
+               nir_intrinsic_set_memory_modes(in, (modes & ~(nir_var_mem_task_payload | nir_var_shader_out)) |
+                                                     nir_var_mem_global);
             continue;
          }
          if (in->intrinsic != nir_intrinsic_load_task_payload)
@@ -325,19 +331,36 @@ bc250_idx_build_cs(const nir_shader *mesh, bool indirect, unsigned provoking, un
    NIR_PASS(_, cs, nir_split_var_copies);
    NIR_PASS(_, cs, nir_lower_var_copies);
    const unsigned V = cs->info.mesh.max_vertices_out, P = cs->info.mesh.max_primitives_out;
-   const unsigned threads = cs->info.workgroup_size[0];
+   /* All invocations (equal to workgroup_size[0] on the ordinary route, which is 1D only). */
+   const unsigned threads = cs->info.workgroup_size[0] * cs->info.workgroup_size[1] * cs->info.workgroup_size[2];
    nir_function_impl *impl = nir_shader_get_entrypoint(cs);
    nir_builder b = nir_builder_create(impl);
-   nir_variable *wg_var = NULL, *draw_var = NULL;
+   nir_variable *wg_var = NULL, *draw_var = NULL, *nwg_var = NULL;
+   /* Task index route: CullPrimitive staged in shared memory (radv_bc250_idx_create made it a shared variable). */
+   nir_variable *cull = NULL;
+   if (payload_stride) {
+      nir_foreach_variable_with_modes (v, cs, nir_var_mem_shared) {
+         if (v->data.location == VARYING_SLOT_CULL_PRIMITIVE)
+            cull = v;
+      }
+   }
    if (indirect) {
       /* The application's WorkGroupID and DrawID are the record's, found in the prologue. */
       wg_var = nir_local_variable_create(impl, glsl_uvec_type(3), "bc250_idx_wg");
       draw_var = nir_local_variable_create(impl, glsl_uint_type(), "bc250_idx_draw");
+      if (payload_stride)
+         nwg_var = nir_local_variable_create(impl, glsl_uvec_type(3), "bc250_idx_nwg");
       nir_foreach_block_safe (block, impl) {
          nir_foreach_instr_safe (instr, block) {
             if (instr->type != nir_instr_type_intrinsic)
                continue;
             nir_intrinsic_instr *in = nir_instr_as_intrinsic(instr);
+            if (nwg_var && in->intrinsic == nir_intrinsic_load_num_workgroups) {
+               b.cursor = nir_before_instr(instr);
+               nir_def_rewrite_uses(&in->def, nir_trim_vector(&b, nir_load_var(&b, nwg_var), in->def.num_components));
+               nir_instr_remove(instr);
+               continue;
+            }
             if (in->intrinsic != nir_intrinsic_load_workgroup_id && in->intrinsic != nir_intrinsic_load_draw_id)
                continue;
             /* Task index route: the record is the producer workgroup; the application's DrawID stays the
@@ -364,8 +387,8 @@ bc250_idx_build_cs(const nir_shader *mesh, bool indirect, unsigned provoking, un
    b.cursor = nir_before_impl(impl);
    nir_def *vbase, *ibase, *obase = NULL;
    if (indirect) {
-      bc250_idx_indirect_prologue(&b, bc250_idx_vertex_stride(mesh), P, wg_var, draw_var, &vbase, &ibase, output_bytes,
-                                  &obase);
+      bc250_idx_indirect_prologue(&b, bc250_idx_vertex_stride(mesh), P, wg_var, draw_var, nwg_var, &vbase, &ibase,
+                                  output_bytes, &obase);
    } else {
       nir_def *flat = nir_iadd(
          &b, nir_load_push_constant(&b, 1, 32, nir_imm_int(&b, 64), .base = 0, .range = RADV_BC250_IDX_CONSTANT_SIZE),
@@ -389,6 +412,31 @@ bc250_idx_build_cs(const nir_shader *mesh, bool indirect, unsigned provoking, un
             nir_store_var(&b, count, pc, 1);
             if (output_bytes)
                nir_pop_if(&b, NULL);
+            nir_instr_remove(instr);
+            continue;
+         }
+         /* Task index route: the shader reads back its own vertex or primitive outputs from where the pass
+          * stored them (not the encoded index array: radv_bc250_idx_create refuses those reads). */
+         if (payload_stride && output_bytes && in->intrinsic == nir_intrinsic_load_deref) {
+            nir_deref_instr *d = nir_src_as_deref(in->src[0]);
+            nir_variable *var = nir_deref_instr_get_variable(d);
+            if (!var || var->data.mode != nir_var_shader_out || var->data.location == VARYING_SLOT_PRIMITIVE_INDICES)
+               continue;
+            b.cursor = nir_before_instr(instr);
+            unsigned size, alignment;
+            glsl_get_explicit_type_for_size_align(var->type, bc250_shared_type, &size, &alignment);
+            nir_def *offset = nir_build_deref_offset(&b, d, bc250_idx_type_size);
+            nir_deref_instr *element = radv_bc250_mesh_output_element(d);
+            nir_def *valid = nir_iand(&b, nir_ult_imm(&b, element->arr.index.ssa, var->data.per_primitive ? P : V),
+                                      nir_ule_imm(&b, offset, size - in->def.num_components * 4));
+            nir_def *zero = nir_imm_zero(&b, in->def.num_components, in->def.bit_size);
+            nir_push_if(&b, valid);
+            nir_def *value = nir_load_global(&b, in->def.num_components, in->def.bit_size,
+               nir_iadd(&b, obase, nir_u2u64(&b, nir_iadd_imm(&b, offset, var->data.driver_location))),
+               .align_mul = 4);
+            nir_pop_if(&b, NULL);
+            value = nir_if_phi(&b, value, zero);
+            nir_def_rewrite_uses(&in->def, value);
             nir_instr_remove(instr);
             continue;
          }
@@ -435,6 +483,16 @@ bc250_idx_build_cs(const nir_shader *mesh, bool indirect, unsigned provoking, un
    nir_push_if(&b, nir_ieq_imm(&b, nir_load_local_invocation_index(&b), 0));
    nir_store_var(&b, count, nir_imm_int(&b, 0), 1);
    nir_pop_if(&b, NULL);
+   /* CullPrimitive: an unwritten primitive is not culled. */
+   if (cull) {
+      for (unsigned first = 0; first < P; first += threads) {
+         nir_def *t = nir_iadd_imm(&b, nir_load_local_invocation_index(&b), first);
+         nir_push_if(&b, nir_ult_imm(&b, t, P));
+         nir_store_deref(&b, nir_build_deref_array(&b, nir_build_deref_var(&b, cull), t),
+                         nir_imm_zero(&b, 1, glsl_get_bit_size(glsl_without_array(cull->type))), 1);
+         nir_pop_if(&b, NULL);
+      }
+   }
    nir_barrier(&b, .execution_scope = SCOPE_WORKGROUP, .memory_scope = SCOPE_WORKGROUP,
                .memory_semantics = NIR_MEMORY_ACQ_REL, .memory_modes = nir_var_mem_shared);
    /* Unused primitive slots: degenerate triangles on the workgroup's first vertex (no fragments). */
@@ -447,7 +505,19 @@ bc250_idx_build_cs(const nir_shader *mesh, bool indirect, unsigned provoking, un
    nir_def *lane = nir_load_local_invocation_index(&b);
    for (unsigned first = 0; first < P; first += threads) {
       nir_def *t = nir_iadd_imm(&b, lane, first);
-      nir_push_if(&b, nir_iand(&b, nir_uge(&b, t, pc), nir_ult_imm(&b, t, P)));
+      nir_def *degenerate = nir_uge(&b, t, pc);
+      /* Task index route: culled primitives become degenerate too. */
+      if (cull) {
+         nir_def *not_culled = nir_imm_false(&b); /* before the if: nir_if_phi must start its block */
+         nir_push_if(&b, nir_ult_imm(&b, t, P));
+         nir_def *flag = nir_load_deref(&b, nir_build_deref_array(&b, nir_build_deref_var(&b, cull), t));
+         if (flag->bit_size != 1)
+            flag = nir_ine_imm(&b, flag, 0);
+         nir_pop_if(&b, NULL);
+         flag = nir_if_phi(&b, flag, not_culled);
+         degenerate = nir_ior(&b, degenerate, flag);
+      }
+      nir_push_if(&b, nir_iand(&b, degenerate, nir_ult_imm(&b, t, P)));
       nir_store_global(&b, nir_vec3(&b, vbase, vbase, vbase),
                        nir_iadd(&b, ibase, nir_u2u64(&b, nir_imul_imm(&b, t, 12))), .write_mask = 7, .align_mul = 4);
       nir_pop_if(&b, NULL);
