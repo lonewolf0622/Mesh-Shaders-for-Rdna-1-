@@ -72,6 +72,8 @@ static const struct radv_directmesh_setting radv_directmesh_settings[] = {
    /* Task + Mesh pipelines without a protected Mesh route run as the Task index route (GPU gate: 24/24, images
     * identical to the Mesh route). */
    {"RADV_BC250_MESH_TASK_IDX", "1"},
+   /* Mesh-only pipelines without a protected route take it behind a built-in one-launch Task stage. */
+   {"RADV_BC250_MESH_TASK_IDX_MESH_ONLY", "1"},
 };
 
 /* Written once per instance creation before any option is read; only ever

@@ -36,7 +36,10 @@ FIXTURES = [('dedup_task64_wide', 'dedup_task64_wide', '1'), ('dedup_task128_wid
             ('compact_task128', 'f', '1'), ('feat_2d_task', 'f', 'force'),
             ('feat_cull_task', 'f', 'force'), ('feat_numwg_task', 'f', 'force'),
             ('feat_view_task', 'f', 'force', {'INDEX_MULTIVIEW': '1'}), ('feat_primid_task', 'feat_primid_task', 'force'),
-            ('feat_layer_task', 'f', 'force'), ('feat_bary_task', 'feat_bary_task', 'force')]
+            ('feat_layer_task', 'f', 'force'), ('feat_bary_task', 'feat_bary_task', 'force'),
+            # Mesh-only pipelines (no Task stage): the built-in Task stage carries WorkGroupID and NumWorkGroups.
+            ('mesh_only_wide', 'mesh_only_wide', '1'), ('mesh_only_ballot', 'mesh_only_wide', 'force')]
+MESH_ONLY = {'mesh_only_wide', 'mesh_only_ballot'}
 for fixture, fragment, switch, *more in FIXTURES:
     mesh = spv('mesh', src / (fixture + '.mesh'), fixture + '.spv')
     frag = spv('frag', src / (fragment + '.frag'), fragment + '.frag.spv')
@@ -51,7 +54,8 @@ for fixture, fragment, switch, *more in FIXTURES:
         cmd = ['bwrap', '--ro-bind', '/', '/', '--dev', '/dev', '--proc', '/proc', '--tmpfs', '/tmp',
                '--bind', str(out), str(out), '--unshare-pid', '--die-with-parent', '--', 'env', '-i',
                *(f'{k}={v}' for k, v in env.items()),
-               str(a.gate.resolve()), '--offline', str(mesh), str(frag), str(out / 'o.rgba'), str(task)]
+               str(a.gate.resolve()), '--offline', str(mesh), str(frag), str(out / 'o.rgba'),
+               *([] if fixture in MESH_ONLY else [str(task)])]
         r = subprocess.run(cmd, capture_output=True, timeout=300)
         log = r.stdout.decode() + r.stderr.decode()
         tag = f'{fixture}-{mode}'
@@ -60,6 +64,7 @@ for fixture, fragment, switch, *more in FIXTURES:
         assert 'NOOP_COMPLETE pixels_not_rendered' in log and 'VALIDATION_ERRORS=0' in log, tag
         assert not re.search(r'(?i)validation failed|ACO ERROR|Assertion|Segmentation|VALIDATION:.*Error', log), tag
         assert 'BC250 TASK IDX: applied' in log and 'draw skipped' not in log, tag
+        assert (fixture in MESH_ONLY) == ('BC250 TASK IDX: applied (Mesh-only)' in log), tag
         passes = len(re.findall(r'^BC250 TASK IDX: pass ', log, re.M))
         assert passes > 0, tag
         rows += 1

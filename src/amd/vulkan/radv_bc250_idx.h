@@ -57,6 +57,10 @@ bool radv_bc250_idx_prune_outputs(nir_shader *mesh, const nir_shader *fragment);
 nir_shader *radv_bc250_idx_build_cs(const nir_shader *mesh, bool indirect, unsigned provoking, unsigned output_bytes,
                                     nir_intrinsic_pass_cb lower_constants);
 /* Task index route: always indirect and stored; task payload reads use constants.compute_args. */
+/* Task index route, Mesh-only pipelines: WorkGroupID and NumWorkGroups read from the built-in Task stage's
+ * payload (bytes 0-11 and 16-27); sets the payload size. */
+#define RADV_BC250_IDX_MESH_ONLY_PAYLOAD 32
+void radv_bc250_idx_lower_mesh_only(nir_shader *mesh);
 nir_shader *radv_bc250_idx_build_task_cs(const nir_shader *mesh, unsigned provoking, unsigned output_bytes,
                                          nir_intrinsic_pass_cb lower_constants, unsigned payload_stride);
 nir_shader *radv_bc250_idx_build_stored_vs(const nir_shader_compiler_options *options, const nir_shader *mesh,

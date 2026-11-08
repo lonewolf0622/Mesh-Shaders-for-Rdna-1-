@@ -47,6 +47,15 @@ STEPS = [
     ('22-multiview-task-idx', 'feat_view_task.mesh.spv', 'f.frag.spv', None, {'INDEX_MULTIVIEW': '1', 'RADV_BC250_MESH_TASK_IDX': 'force'}, 'BC250 TASK IDX: applied', '21-multiview-mesh-route'),
     ('23-compact-task-idx-direct', 'compact_task128.mesh.spv', 'f.frag.spv', None, {'RADV_BC250_MESH_TASK_IDX': '1'}, 'BC250 TASK IDX: applied', None),
     ('24-compact-task-idx-indirect', 'compact_task128.mesh.spv', 'f.frag.spv', 'count', {'RADV_BC250_MESH_TASK_IDX': '1'}, 'BC250 TASK IDX: applied', None),
+    # Mesh-only pipelines (no Task stage) behind the built-in Task stage. mesh_only_wide is the reported shape (13 KB
+    # shared, ballot, no Mesh route); its picture equals mesh_only_ballot on the Mesh route.
+    ('25-mesh-only-mesh-route', 'mesh_only_ballot.mesh.spv', 'mesh_only_wide.frag.spv', None, {}, '!BC250 TASK IDX: applied', None),
+    ('26-mesh-only-task-idx', 'mesh_only_ballot.mesh.spv', 'mesh_only_wide.frag.spv', None, {'RADV_BC250_MESH_TASK_IDX': 'force'}, 'BC250 TASK IDX: applied (Mesh-only)', '25-mesh-only-mesh-route'),
+    ('27-mesh-only-wide', 'mesh_only_wide.mesh.spv', 'mesh_only_wide.frag.spv', None, {}, 'BC250 TASK IDX: applied (Mesh-only)', '25-mesh-only-mesh-route'),
+    ('28-mesh-only-mesh-route-indirect', 'mesh_only_ballot.mesh.spv', 'mesh_only_wide.frag.spv', 'count', {}, '!BC250 TASK IDX: applied', None),
+    ('29-mesh-only-wide-indirect', 'mesh_only_wide.mesh.spv', 'mesh_only_wide.frag.spv', 'count', {}, 'BC250 TASK IDX: applied (Mesh-only)', '28-mesh-only-mesh-route-indirect'),
+    # Twelve recordings hold index storage at once (about 230 MiB; the old 128 MiB budget skipped draws after six).
+    ('30-storage-12-recordings', 'mesh_only_wide.mesh.spv', 'mesh_only_wide.frag.spv', None, {'INDEX_RECORDINGS': '12'}, 'BC250 TASK IDX: applied (Mesh-only)', '25-mesh-only-mesh-route'),
 ]
 
 
@@ -73,7 +82,9 @@ def run_step(name, mesh, frag, indirect, extra, marker):
     if indirect:
         env['INDEX_INDIRECT'] = indirect
     env.update(extra)
-    cmd = [os.path.join(KIT, 'index_gate'), '--authorized-gpu-INDEX', SH(mesh), SH(frag), image, SH('t.task.spv')]
+    # Mesh-only fixtures run without a Task stage.
+    task = [] if mesh.startswith('mesh_only') else [SH('t.task.spv')]
+    cmd = [os.path.join(KIT, 'index_gate'), '--authorized-gpu-INDEX', SH(mesh), SH(frag), image, *task]
     log = open(log_path, 'w')
     log.write('$ ' + ' '.join(f'{k}={v}' for k, v in extra.items()) + ' ' + ' '.join(cmd) + '\n')
     proc = subprocess.Popen(cmd, env=env, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
@@ -124,6 +135,8 @@ def run_step(name, mesh, frag, indirect, extra, marker):
     log.close()
     if proc.returncode != 0 or not os.path.exists(image):
         return False, f'exit {proc.returncode}'
+    if 'draw skipped' in rest.decode(errors='replace'):
+        return False, 'a Task index route draw was skipped'
     synced_write(os.path.join(STATE, name + '.done'), time.strftime('%Y-%m-%dT%H:%M:%S\n'))
     return True, ''
 

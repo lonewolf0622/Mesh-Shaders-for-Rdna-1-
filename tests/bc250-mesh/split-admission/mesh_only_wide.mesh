@@ -1,0 +1,34 @@
+#version 460
+#extension GL_EXT_mesh_shader : require
+#extension GL_KHR_shader_subgroup_ballot : require
+// The reported Mesh-only shape: V=128 P=64, 32 invocations, ten vertex outputs, subgroup ballot and about 13 KB of
+// application shared memory that stays live past the first output store, so staging cannot reuse it. No Mesh
+// route fits; the Task index route takes it behind its built-in Task stage. The scratch reads add zero, so the
+// picture equals mesh_only_ballot.mesh on the Mesh route.
+layout(local_size_x=32) in;
+layout(triangles, max_vertices=128, max_primitives=64) out;
+layout(location=0) flat out vec4 attr[][10];
+shared uint lut[128];
+shared uint scratch[3120];
+
+void main(){
+ uint i=gl_LocalInvocationIndex;
+ uint wg=gl_WorkGroupID.x+gl_WorkGroupID.y*gl_NumWorkGroups.x;
+ uint n=gl_NumWorkGroups.x*gl_NumWorkGroups.y;
+ uint bits=subgroupBallotBitCount(subgroupBallot((i+wg)%3u==0u));
+ for(uint v=i; v<128u; v+=32u) lut[v]=v+(bits&1u);
+ for(uint v=i; v<3120u; v+=32u) scratch[v]=v;
+ barrier();
+ SetMeshOutputsEXT(128,64);
+ float tx=float(wg%8u), ty=float((wg/8u)%8u);
+ for(uint v=i; v<128u; v+=32u){
+   float col=float(v%16u), row=float(v/16u);
+   gl_MeshVerticesEXT[v].gl_Position=vec4((tx+col/8.0)/4.0-1.0,(ty+row/4.0)/4.0-1.0,0.5,1);
+   for(uint k=0u; k<10u; k++)
+     attr[v][k]=vec4(float(wg)/float(n),float(bits)/32.0,float(lut[v]-v+scratch[(v*25u)%3120u]-(v*25u)%3120u),float(k)/10.0)*0.1;
+ }
+ for(uint p=i; p<64u; p+=32u){
+   uint q=p/2u, qx=q%8u, qy=q/8u, a=qy*16u+qx;
+   gl_PrimitiveTriangleIndicesEXT[p]=(p&1u)==0u?uvec3(a,a+1u,a+16u):uvec3(a+1u,a+17u,a+16u);
+ }
+}

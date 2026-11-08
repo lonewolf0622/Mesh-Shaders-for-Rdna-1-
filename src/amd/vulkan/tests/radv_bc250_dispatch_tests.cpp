@@ -244,6 +244,7 @@ TEST(radv_directmesh, preset_table_matches_previous_setenv_preset)
       {"RADV_BC250_NGGC_WIDE", "1"},
       {"RADV_BC250_DCC_32B", "1"},
       {"RADV_BC250_MESH_TASK_IDX", "1"},
+      {"RADV_BC250_MESH_TASK_IDX_MESH_ONLY", "1"},
    };
    unsigned count = 0;
    const struct radv_directmesh_setting *table = radv_directmesh_settings_table(&count);

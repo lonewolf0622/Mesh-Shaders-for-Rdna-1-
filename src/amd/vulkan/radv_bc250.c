@@ -56,11 +56,30 @@ static void bc250_task_idx_consume(struct radv_cmd_buffer *cmd_buffer, struct ra
 #define BC250_IDX_POOL_MAX_BYTES (16ull << 20)
 #define BC250_IDX_POOL_BYTES (16ull << 20)
 
+/* Budget for index-route storage. Each recording that uses the route holds a 16 MiB pool plus its tables and
+ * pages (about 19 MiB for the Task index route), and games keep several recordings pending. On the BC-250 the
+ * storage is GPU-only GTT (bc250_idx_create_storage), not the 512 MiB carve-out, so the budget is 1 GiB, at most
+ * an eighth of GTT. Local-VRAM boards keep 128 MiB of VRAM. It is a limit: storage is allocated only as
+ * recordings use the route. RADV_BC250_IDX_STORAGE_MB overrides it (diagnostic). */
+static uint32_t
+bc250_idx_storage_limit(const struct radv_physical_device *pdev)
+{
+   uint64_t limit = 128ull << 20;
+   if (pdev->info.family == CHIP_GFX1013)
+      limit = CLAMP((uint64_t)pdev->info.gart_size_kb * 1024 / 8, 128ull << 20, 1ull << 30);
+   const int64_t mb = debug_get_num_option("RADV_BC250_IDX_STORAGE_MB", 0);
+   if (mb > 0)
+      limit = MIN2((uint64_t)mb << 20, 2ull << 30);
+   return limit;
+}
+
 void
 radv_bc250_device_env_init(struct radv_device *device, const struct radv_physical_device *pdev)
 {
    struct radv_bc250_device_env *env = &device->bc250_env;
    simple_mtx_init(&device->bc250_idx_spare_mtx, mtx_plain);
+   device->bc250_idx_storage_limit = bc250_idx_storage_limit(pdev);
+   device->bc250_idx_spare_limit = device->bc250_idx_storage_limit / 4;
    env->pipeline_plan = pdev->bc250_native_mesh && !pdev->bc250_native_task &&
       pdev->info.family == CHIP_GFX1013 && debug_get_bool_option("RADV_BC250_PIPELINE_PLAN", false);
    env->gpl_source_link = env->pipeline_plan && debug_get_bool_option("RADV_BC250_GPL_SOURCE_LINK", false);
@@ -91,6 +110,7 @@ radv_bc250_device_env_init(struct radv_device *device, const struct radv_physica
                    (task_idx_force || radv_dm_bool("RADV_BC250_MESH_TASK_IDX", false));
    env->task_idx_passes = CLAMP(radv_dm_num("RADV_BC250_MESH_TASK_IDX_PASSES", 0), 0, 16);
    env->task_idx_force = env->task_idx && task_idx_force;
+   env->task_idx_mesh_only = env->task_idx && radv_dm_bool("RADV_BC250_MESH_TASK_IDX_MESH_ONLY", false);
    env->idx_trace = getenv("BC250_IDX_TRACE") != NULL;
    env->idx_debug = getenv("RADV_BC250_IDX_DEBUG") != NULL;
    env->idx_capture_batch = getenv("BC250_IDX_CAPTURE_BATCH") != NULL;
@@ -5416,6 +5436,9 @@ bc250_idx_eligible(nir_shader *mesh, nir_shader *fs, bool task, const char **why
    if ((contract.workgroup_size[1] != 1 || contract.workgroup_size[2] != 1) && !task) { *why = "2D/3D workgroup"; return false; }
    /* The Task index route reads the hybrid producer's payload records (radv_bc250_idx_build_task_cs). */
    if (contract.task_payload_size && !task) { *why = "task payload"; return false; }
+   /* The index pass adds its own shared variables, which nir_assign_shared_var_locations cannot place beside
+    * explicitly laid out (aliasing block) application shared memory. */
+   if (contract.shared_memory_explicit_layout) { *why = "explicit shared memory layout"; return false; }
    if (contract.max_vertices > 256 || contract.max_primitives > 256 || !threads) { *why = "size"; return false; }
    /* Measured: at most 32 vertices the Mesh route is faster (no split, one wave). */
    /* The Task index route has no Mesh route to prefer. */
@@ -7850,7 +7873,33 @@ bc250_idx_task_primitive_builtins(nir_shader *mesh, nir_shader *frag)
 struct bc250_idx_task_params {
    unsigned task_payload_size;
    const VkAllocationCallbacks *allocator;
+   /* Mesh-only pipeline behind bc250_idx_mesh_only_task: WorkGroupID and NumWorkGroups come from the payload. */
+   bool mesh_only;
 };
+
+/* Mesh-only pipelines on the Task index route: a built-in Task stage with one invocation per application Mesh
+ * workgroup stores that workgroup's WorkGroupID (payload bytes 0-11) and NumWorkGroups (bytes 16-27) and launches
+ * one Mesh workgroup. The producer emulates the full-dispatch values for both (bc250_lower_intrinsic), so the
+ * Mesh stage sees the application's own values through radv_bc250_idx_lower_mesh_only. */
+#define BC250_IDX_MESH_ONLY_PAYLOAD RADV_BC250_IDX_MESH_ONLY_PAYLOAD
+
+static nir_shader *
+bc250_idx_mesh_only_task(struct radv_device *device)
+{
+   nir_builder tb = nir_builder_init_simple_shader(MESA_SHADER_TASK, &device->compiler_info.nir_options[MESA_SHADER_TASK],
+                                                   "bc250_task_idx_mesh_only");
+   tb.shader->info.workgroup_size[0] = 1;
+   tb.shader->info.workgroup_size[1] = 1;
+   tb.shader->info.workgroup_size[2] = 1;
+   tb.shader->info.task_payload_size = BC250_IDX_MESH_ONLY_PAYLOAD;
+   nir_store_task_payload(&tb, nir_load_workgroup_id(&tb), nir_imm_int(&tb, 0), .write_mask = 7, .align_mul = 16);
+   nir_store_task_payload(&tb, nir_load_num_workgroups(&tb), nir_imm_int(&tb, 16), .write_mask = 7, .align_mul = 16);
+   nir_launch_mesh_workgroups(&tb, nir_imm_ivec3(&tb, 1, 1, 1), .range = BC250_IDX_MESH_ONLY_PAYLOAD);
+   nir_shader_gather_info(tb.shader, nir_shader_get_entrypoint(tb.shader));
+   nir_validate_shader(tb.shader, "BC250 Task index route Mesh-only producer");
+   return tb.shader;
+}
+
 
 static void
 bc250_idx_create(struct radv_device *device, struct radv_graphics_pipeline *pipeline,
@@ -7906,6 +7955,8 @@ bc250_idx_create(struct radv_device *device, struct radv_graphics_pipeline *pipe
       NIR_PASS(_, mesh, nir_split_var_copies);
       NIR_PASS(_, mesh, nir_lower_var_copies);
    }
+   if (task && task->mesh_only && mesh)
+      radv_bc250_idx_lower_mesh_only(mesh);
    if (task && mesh && frag)
       bc250_idx_task_primitive_builtins(mesh, frag);
    if (!mesh || !frag || !bc250_idx_eligible(mesh, frag, task != NULL, &why)) {
@@ -8180,41 +8231,48 @@ radv_bc250_task_idx_pipeline_create(struct radv_device *device, const VkGraphics
       else if (pCreateInfo->pStages[i].stage == VK_SHADER_STAGE_MESH_BIT_EXT)
          has_mesh = true;
    }
-   if (!task_info || !has_mesh || !pCreateInfo->layout)
+   /* A Mesh-only pipeline runs behind a built-in Task stage (bc250_idx_mesh_only_task). */
+   const bool mesh_only = !task_info && device->bc250_env.task_idx_mesh_only;
+   if ((!task_info && !mesh_only) || !has_mesh || !pCreateInfo->layout)
       return VK_ERROR_FEATURE_NOT_PRESENT;
    const VkPipelineCreateFlags2 flags = vk_graphics_pipeline_create_flags(pCreateInfo);
    if (flags & (VK_PIPELINE_CREATE_2_LIBRARY_BIT_KHR | VK_PIPELINE_CREATE_2_INDIRECT_BINDABLE_BIT_EXT))
       return VK_ERROR_FEATURE_NOT_PRESENT;
    VK_FROM_HANDLE(radv_pipeline_layout, layout, pCreateInfo->layout);
 
-   struct radv_shader_stage ts = {0};
-   const struct radv_shader_stage_key ts_key =
-      radv_pipeline_get_shader_key(&device->compiler_info, task_info, flags, pCreateInfo->pNext);
-   radv_pipeline_stage_init(flags, task_info, layout, &ts_key, &ts);
-   if (ts.layout.mapping) {
-      if (trace)
-         fprintf(stderr, "BC250 TASK IDX: declined (stage layout mapping)\n");
-      return VK_ERROR_FEATURE_NOT_PRESENT;
+   nir_shader *task;
+   if (mesh_only) {
+      task = bc250_idx_mesh_only_task(device);
+   } else {
+      struct radv_shader_stage ts = {0};
+      const struct radv_shader_stage_key ts_key =
+         radv_pipeline_get_shader_key(&device->compiler_info, task_info, flags, pCreateInfo->pNext);
+      radv_pipeline_stage_init(flags, task_info, layout, &ts_key, &ts);
+      if (ts.layout.mapping) {
+         if (trace)
+            fprintf(stderr, "BC250 TASK IDX: declined (stage layout mapping)\n");
+         return VK_ERROR_FEATURE_NOT_PRESENT;
+      }
+      const VkPipelineRenderingCreateInfo *rendering = vk_get_pipeline_rendering_create_info(pCreateInfo);
+      struct radv_spirv_to_nir_options options = {.lower_view_index_to_zero = !(rendering && rendering->viewMask)};
+      task = radv_shader_spirv_to_nir_cached(&device->compiler_info, NULL, &ts, &options, false);
+      if (!task)
+         return VK_ERROR_FEATURE_NOT_PRESENT;
+      /* The producer runs once for all views (as on the hybrid route): a Task shader reading ViewIndex is refused. */
+      nir_shader_gather_info(task, nir_shader_get_entrypoint(task));
+      if (BITSET_TEST(task->info.system_values_read, SYSTEM_VALUE_VIEW_INDEX)) {
+         if (trace)
+            fprintf(stderr, "BC250 TASK IDX: declined (multiview Task shader reads ViewIndex)\n");
+         ralloc_free(task);
+         return VK_ERROR_FEATURE_NOT_PRESENT;
+      }
+      /* As the hybrid producer: application constants from the copied block, DrawID the draw's. */
+      NIR_PASS(_, task, nir_shader_intrinsics_pass, bc250_lower_application_constants, nir_metadata_control_flow, NULL);
    }
-   const VkPipelineRenderingCreateInfo *rendering = vk_get_pipeline_rendering_create_info(pCreateInfo);
-   struct radv_spirv_to_nir_options options = {.lower_view_index_to_zero = !(rendering && rendering->viewMask)};
-   nir_shader *task = radv_shader_spirv_to_nir_cached(&device->compiler_info, NULL, &ts, &options, false);
-   if (!task)
-      return VK_ERROR_FEATURE_NOT_PRESENT;
-   /* The producer runs once for all views (as on the hybrid route): a Task shader reading ViewIndex is refused. */
-   nir_shader_gather_info(task, nir_shader_get_entrypoint(task));
-   if (BITSET_TEST(task->info.system_values_read, SYSTEM_VALUE_VIEW_INDEX)) {
-      if (trace)
-         fprintf(stderr, "BC250 TASK IDX: declined (multiview Task shader reads ViewIndex)\n");
-      ralloc_free(task);
-      return VK_ERROR_FEATURE_NOT_PRESENT;
-   }
-   /* As the hybrid producer: application constants from the copied block, DrawID the draw's. */
-   NIR_PASS(_, task, nir_shader_intrinsics_pass, bc250_lower_application_constants, nir_metadata_control_flow, NULL);
 
    struct radv_graphics_pipeline route = {0};
    const struct bc250_idx_task_params params = {.task_payload_size = task->info.task_payload_size,
-                                                .allocator = pAllocator};
+                                                .allocator = pAllocator, .mesh_only = mesh_only};
    const char *why = NULL;
    bc250_idx_create(device, &route, pCreateInfo, &params, &why);
    if (!route.bc250_idx_gfx) {
@@ -8258,8 +8316,8 @@ radv_bc250_task_idx_pipeline_create(struct radv_device *device, const VkGraphics
       return VK_ERROR_FEATURE_NOT_PRESENT;
    }
    if (trace)
-      fprintf(stderr, "BC250 TASK IDX: applied V=%u P=%u payload_stride=%u output_bytes=%u passes=%u chunk=%u\n",
-              pipeline->bc250_idx_vertices, pipeline->bc250_idx_primitives, pipeline->bc250_payload_stride,
+      fprintf(stderr, "BC250 TASK IDX: applied%s V=%u P=%u payload_stride=%u output_bytes=%u passes=%u chunk=%u\n",
+              mesh_only ? " (Mesh-only)" : "", pipeline->bc250_idx_vertices, pipeline->bc250_idx_primitives, pipeline->bc250_payload_stride,
               pipeline->bc250_idx_output_bytes, pipeline->bc250_task_idx_passes, bc250_task_chunk(pipeline));
    *pPipeline = route.bc250_idx_gfx;
    return VK_SUCCESS;
@@ -8267,21 +8325,20 @@ radv_bc250_task_idx_pipeline_create(struct radv_device *device, const VkGraphics
 
 /* Command buffers may be pending concurrently, or submitted repeatedly, so their written ranges stay private to
  * the recording until it is reset or destroyed (neither is allowed while it is pending). Share a device-wide
- * reservation budget instead of aliasing their storage: the 512 MiB carve-out keeps at most 128 MiB for this
- * optional route, and allocation failure takes Mesh. A reset or destroyed command buffer returns its pages and
+ * reservation budget instead of aliasing their storage (bc250_idx_storage_limit); allocation failure takes Mesh
+ * (index route) or skips the draw (Task index route). A reset or destroyed command buffer returns its pages and
  * pool to a device spare list that the next recording takes from, so steady-state frames create no buffers and
- * idle command buffers hold no storage. The spare list keeps at most 32 MiB; the rest is freed. A recording uses
- * at most 16 MiB of pages. The side stream (command memory, not counted here) persists with its command buffer. */
-#define BC250_IDX_STORAGE_BYTES (128u << 20)
+ * idle command buffers hold no storage. The spare list keeps at most a quarter of the budget; the rest is freed.
+ * A recording uses at most 16 MiB of pages. The side stream (command memory, not counted here) persists with its
+ * command buffer. */
 #define BC250_IDX_PAGE_BYTES (16u << 20)
-#define BC250_IDX_SPARE_BYTES (32u << 20)
 
 static void
 bc250_idx_spare_put(struct radv_device *device, struct radeon_winsys_bo *bo, uint32_t size, bool pool)
 {
    simple_mtx_lock(&device->bc250_idx_spare_mtx);
    const unsigned n = device->bc250_idx_spare_count;
-   if (n < ARRAY_SIZE(device->bc250_idx_spare) && size <= BC250_IDX_SPARE_BYTES - device->bc250_idx_spare_bytes) {
+   if (n < ARRAY_SIZE(device->bc250_idx_spare) && size <= device->bc250_idx_spare_limit - device->bc250_idx_spare_bytes) {
       device->bc250_idx_spare[n].bo = bo;
       device->bc250_idx_spare[n].size = size;
       device->bc250_idx_spare[n].pool = pool;
@@ -8335,7 +8392,7 @@ bc250_idx_reserve_once(struct radv_device *device, uint32_t bytes)
 {
    uint32_t old = p_atomic_read(&device->bc250_idx_storage_bytes);
    do {
-      if (bytes > BC250_IDX_STORAGE_BYTES - old)
+      if (bytes > device->bc250_idx_storage_limit - old)
          return false;
       uint32_t seen = p_atomic_cmpxchg(&device->bc250_idx_storage_bytes, old, old + bytes);
       if (seen == old)
@@ -9167,11 +9224,13 @@ bc250_idx_task_pass(struct radv_cmd_buffer *cmd_buffer, struct radv_graphics_pip
 }
 
 static void
-bc250_task_idx_skip(const char *why)
+bc250_task_idx_skip(struct radv_device *device, const char *why)
 {
    static int warned;
    if (!__atomic_exchange_n(&warned, 1, __ATOMIC_RELAXED))
-      fprintf(stderr, "radv/bc250: Task index route draw skipped (%s); further skips are not reported\n", why);
+      fprintf(stderr, "radv/bc250: Task index route draw skipped (%s, storage %u of %u MiB); further skips are not "
+              "reported\n", why, p_atomic_read(&device->bc250_idx_storage_bytes) >> 20,
+              device->bc250_idx_storage_limit >> 20);
 }
 
 /* RADV_BC250_MESH_TASK_IDX consumer: replaces the hybrid Task path's Mesh draw over a producer chunk. Each
@@ -9188,7 +9247,7 @@ bc250_task_idx_consume(struct radv_cmd_buffer *cmd_buffer, struct radv_graphics_
     * pass drains earlier work before it rewrites the pool and the table sets (concurrent execution on two
     * queues is not protected). */
    if (cmd_buffer->bc250_dgc_upload_va || max_count > BC250_TASK_IDX_MAX_CHUNK) {
-      bc250_task_idx_skip("device-generated commands");
+      bc250_task_idx_skip(radv_cmd_buffer_device(cmd_buffer), "device-generated commands");
       return;
    }
    struct radv_device *device = radv_cmd_buffer_device(cmd_buffer);
@@ -9234,7 +9293,7 @@ bc250_task_idx_consume(struct radv_cmd_buffer *cmd_buffer, struct radv_graphics_
                vk_command_buffer_set_error(&cmd_buffer->vk, VK_ERROR_OUT_OF_DEVICE_MEMORY);
                return;
             }
-            bc250_task_idx_skip("index storage unavailable");
+            bc250_task_idx_skip(device, "index storage unavailable");
             return;
          }
          rec = mesh;

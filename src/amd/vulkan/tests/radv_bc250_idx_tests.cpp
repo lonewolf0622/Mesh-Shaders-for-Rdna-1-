@@ -685,7 +685,7 @@ TEST_F(radv_bc250_idx_test, fetch_preserves_clip_cull_lengths)
 /* Task index route features the ordinary index route refuses: interpreted index pass and fetch shader.
  * Invocations run one after another (shared atomics are sequential), so every check below only depends on
  * values an invocation wrote itself or on that sequential order. */
-enum task_feature { TASK_COMPACT, TASK_CULL, TASK_READ_BACK, TASK_NUM_WORKGROUPS };
+enum task_feature { TASK_COMPACT, TASK_CULL, TASK_READ_BACK, TASK_NUM_WORKGROUPS, TASK_MESH_ONLY };
 
 static void
 task_feature_roundtrip(nir_builder *b, task_feature feature)
@@ -730,6 +730,7 @@ task_feature_roundtrip(nir_builder *b, task_feature feature)
       nir_store_deref(b, at(var0, i), nir_iadd_imm(b, nir_channel(b, nir_load_deref(b, at(pos, i)), 0), 5), 1);
       break;
    case TASK_NUM_WORKGROUPS:
+   case TASK_MESH_ONLY:
       nir_store_deref(b, at(var0, i), nir_channel(b, nir_load_num_workgroups(b), 0), 1);
       break;
    }
@@ -738,10 +739,18 @@ task_feature_roundtrip(nir_builder *b, task_feature feature)
                    nir_vec3(b, i, nir_iand_imm(b, nir_iadd_imm(b, i, 1), 63), nir_iand_imm(b, nir_iadd_imm(b, i, 2), 63)), 7);
    nir_shader_gather_info(b->shader, b->impl);
 
+   /* Mesh-only: WorkGroupID and NumWorkGroups come from the built-in Task stage's payload. */
+   const unsigned payload_stride = feature == TASK_MESH_ONLY ? RADV_BC250_IDX_MESH_ONLY_PAYLOAD : 16;
+   if (feature == TASK_MESH_ONLY) {
+      radv_bc250_idx_lower_mesh_only(b->shader);
+      nir_shader_gather_info(b->shader, b->impl);
+      EXPECT_FALSE(BITSET_TEST(b->shader->info.system_values_read, SYSTEM_VALUE_WORKGROUP_ID));
+      EXPECT_FALSE(BITSET_TEST(b->shader->info.system_values_read, SYSTEM_VALUE_NUM_WORKGROUPS));
+   }
    const bool has_pp = pp != nullptr;
    const unsigned bytes = radv_bc250_idx_output_layout(b->shader);
    ASSERT_NE(bytes, 0u);
-   nir_shader *cs = radv_bc250_idx_build_task_cs(b->shader, 0, bytes, NULL, 16);
+   nir_shader *cs = radv_bc250_idx_build_task_cs(b->shader, 0, bytes, NULL, payload_stride);
    nir_shader *vs = radv_bc250_idx_build_stored_vs(b->shader->options, b->shader, bytes);
    nir_foreach_shader_out_variable (v, vs)
       v->data.driver_location = v->data.location;
@@ -754,7 +763,15 @@ task_feature_roundtrip(nir_builder *b, task_feature feature)
    std::vector<uint8_t> ib(first * 4 + groups * (P * 12 + bytes), 0xa5);
    std::vector<uint32_t> dims = {0, 0, 0, groups, 1, 1}, draws = {0, 0, 0, 0, 0, groups * P * 3, 1, first, 0, groups};
    std::vector<uint32_t> table = {2, groups, groups, 1, 1, 0, 0, 0, 0, 0, groups};
-   std::vector<uint32_t> payloads(8, 0);
+   std::vector<uint32_t> payloads(2 * payload_stride / 4, 0);
+   /* Mesh-only: the draw's workgroups belong to record 1 (dims); its payload holds the application's WorkGroupID
+    * (1234) and NumWorkGroups (77) as the built-in Task stage stores them. Record 0 holds decoys. */
+   if (feature == TASK_MESH_ONLY) {
+      payloads[0] = 555;
+      payloads[4] = 666;
+      payloads[payload_stride / 4] = 1234;
+      payloads[payload_stride / 4 + 4] = 77;
+   }
    bc250_dgc_nir_interpreter producer(cs), fetch(vs);
    producer.mappings = {{ibva, ib.size(), ib.data()},
                         {dimsva, dims.size() * 4, (uint8_t *)dims.data()},
@@ -785,9 +802,11 @@ task_feature_roundtrip(nir_builder *b, task_feature feature)
             EXPECT_EQ(k, grp * vstride + v + (has_pp && c == 0 ? (s + 1) * 64 : 0));
             fetch.vertex_id = k;
             fetch.run(vs, 0, 0);
-            EXPECT_EQ(fetch.outputs[VARYING_SLOT_POS * 4], v + grp * 100);
+            const unsigned app_group = feature == TASK_MESH_ONLY ? 1234 : grp;
+            EXPECT_EQ(fetch.outputs[VARYING_SLOT_POS * 4], v + app_group * 100);
             const unsigned expected0 = feature == TASK_READ_BACK ? v + grp * 100 + 5 :
-                                       feature == TASK_NUM_WORKGROUPS ? groups : 7;
+                                       feature == TASK_NUM_WORKGROUPS ? groups :
+                                       feature == TASK_MESH_ONLY ? 77 : 7;
             EXPECT_EQ(fetch.outputs[VARYING_SLOT_VAR0 * 4], expected0);
             if (has_pp && c == 0) {
                EXPECT_EQ(fetch.outputs[(VARYING_SLOT_VAR0 + 2) * 4], writer * 11 + grp);
@@ -814,4 +833,8 @@ TEST_F(radv_bc250_idx_test, task_output_read_back)
 TEST_F(radv_bc250_idx_test, task_num_workgroups)
 {
    task_feature_roundtrip(b, TASK_NUM_WORKGROUPS);
+}
+TEST_F(radv_bc250_idx_test, task_mesh_only_payload_ids)
+{
+   task_feature_roundtrip(b, TASK_MESH_ONLY);
 }

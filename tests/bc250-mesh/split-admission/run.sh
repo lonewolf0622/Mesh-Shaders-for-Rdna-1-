@@ -74,15 +74,15 @@ explicit_layout128|explicit_layout128|-||-8|split rejected: explicit shared memo
 numwg128|numwg128|-||0|direct mesh-only split enabled: pieces=3
 numwg_single|numwg_single|-||0|split applied: pieces=1
 numwg_task|numwg_task|t||0|split applied: pieces=3
-numwg128_amplifier|numwg128|-|BC250_EXPERIMENTAL_DIRECT_SPLIT=false|-8|load_num_workgroups (internal amplifier)
+numwg128_amplifier|numwg128|-|BC250_EXPERIMENTAL_DIRECT_SPLIT=false RADV_BC250_MESH_TASK_IDX_MESH_ONLY=0|-8|load_num_workgroups (internal amplifier)
 # class 3: write-only external atomics, first piece only
 atomic_cull_shared64|atomic_cull_shared64|-||0|external atomics: 1 guarded to the first piece
-atomic_used128|atomic_used128|-||-8|split rejected: external atomic result used
-atomic_read128|atomic_read128|-||-8|split rejected: external atomic with external memory reads
+atomic_used128|atomic_used128|-|RADV_BC250_MESH_TASK_IDX_MESH_ONLY=0|-8|split rejected: external atomic result used
+atomic_read128|atomic_read128|-|RADV_BC250_MESH_TASK_IDX_MESH_ONLY=0|-8|split rejected: external atomic with external memory reads
 # G1 probes (scratch_G1), unchanged sources
-tri64_cull_shared|tri64_cull_shared|-||-8|split rejected: store_ssbo
-tri256_barrier|tri256_barrier|-||-8|split rejected: store_ssbo
-tri128_numwg|tri128_numwg|-||-8|split rejected: store_ssbo
+tri64_cull_shared|tri64_cull_shared|-|RADV_BC250_MESH_TASK_IDX_MESH_ONLY=0|-8|split rejected: store_ssbo
+tri256_barrier|tri256_barrier|-|RADV_BC250_MESH_TASK_IDX_MESH_ONLY=0|-8|split rejected: store_ssbo
+tri128_numwg|tri128_numwg|-|RADV_BC250_MESH_TASK_IDX_MESH_ONLY=0|-8|split rejected: store_ssbo
 tri128_atomic|tri128_atomic|-||0|external atomics: 1 guarded to the first piece
 # shared atomics whose result nothing reads: admitted (no taint reaches the primitives)
 tri128_shatomic|tri128_shatomic|-||0|split shared atomics admitted: pieces=2
@@ -115,5 +115,15 @@ feat_view_task|feat_view_task|t|RADV_BC250_MESH_TASK_IDX=force|0|BC250 TASK IDX:
 feat_primid_task|feat_primid_task|t|RADV_BC250_MESH_TASK_IDX=force|0|BC250 TASK IDX: applied
 feat_layer_task|feat_layer_task|t|RADV_BC250_MESH_TASK_IDX=force|0|BC250 TASK IDX: applied
 feat_bary_task|feat_bary_task|t|RADV_BC250_MESH_TASK_IDX=force|0|BC250 TASK IDX: applied
+# Mesh-only pipelines without a Mesh route (reported shape: V=128 P=64, 13 KB shared, ballot, storage writes) take the
+# Task index route behind its built-in Task stage
+mesh_only_wide|mesh_only_wide|-|RADV_BC250_MESH_TASK_IDX=0|-8|BC250 MESH FAIL CLOSED
+mesh_only_wide_off|mesh_only_wide|-|RADV_BC250_MESH_TASK_IDX_MESH_ONLY=0|-8|BC250 MESH FAIL CLOSED
+mesh_only_wide_idx|mesh_only_wide|-||0|BC250 TASK IDX: applied (Mesh-only)
+mesh_only_ssbo_idx|mesh_only_ssbo|-||0|BC250 TASK IDX: applied (Mesh-only)
+# rows above with RADV_BC250_MESH_TASK_IDX_MESH_ONLY=0 check the Mesh route's decision; by default such shapes render here
+atomic_used128_idx|atomic_used128|-||0|BC250 TASK IDX: applied (Mesh-only)
+# explicit (aliasing) shared layouts stay refused: the index pass cannot place its own shared variables beside them
+explicit_layout128_idx|explicit_layout128|-||-8|BC250 TASK IDX: declined (explicit shared memory layout)
 EOF
 exit $fail

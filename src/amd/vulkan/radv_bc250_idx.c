@@ -323,6 +323,29 @@ radv_bc250_idx_build_cs(const nir_shader *mesh, bool indirect, unsigned provokin
    return bc250_idx_build_cs(mesh, indirect, provoking, output_bytes, lower_constants, 0);
 }
 
+static bool
+bc250_idx_mesh_only_lower_instr(nir_builder *b, nir_intrinsic_instr *in, void *data)
+{
+   unsigned offset;
+   if (in->intrinsic == nir_intrinsic_load_workgroup_id)
+      offset = 0;
+   else if (in->intrinsic == nir_intrinsic_load_num_workgroups)
+      offset = 16;
+   else
+      return false;
+   b->cursor = nir_before_instr(&in->instr);
+   nir_def *v = nir_load_task_payload(b, in->def.num_components, 32, nir_imm_int(b, offset), .align_mul = 16);
+   nir_def_replace(&in->def, v);
+   return true;
+}
+
+void
+radv_bc250_idx_lower_mesh_only(nir_shader *mesh)
+{
+   NIR_PASS(_, mesh, nir_shader_intrinsics_pass, bc250_idx_mesh_only_lower_instr, nir_metadata_control_flow, NULL);
+   mesh->info.task_payload_size = RADV_BC250_IDX_MESH_ONLY_PAYLOAD;
+}
+
 nir_shader *
 radv_bc250_idx_build_task_cs(const nir_shader *mesh, unsigned provoking, unsigned output_bytes,
                              nir_intrinsic_pass_cb lower_constants, unsigned payload_stride)

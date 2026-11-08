@@ -168,6 +168,7 @@ struct radv_bc250_device_env {
    /* Index-route switches read once here instead of on every draw. */
    bool task_idx;             /* RADV_BC250_MESH_TASK_IDX */
    bool task_idx_force;       /* RADV_BC250_MESH_TASK_IDX=force (testing) */
+   bool task_idx_mesh_only;   /* RADV_BC250_MESH_TASK_IDX_MESH_ONLY: also Mesh-only pipelines */
    unsigned task_idx_passes;  /* RADV_BC250_MESH_TASK_IDX_PASSES, 0 = per pipeline */
    bool idx_trace;            /* BC250_IDX_TRACE */
    bool idx_debug;            /* RADV_BC250_IDX_DEBUG */
@@ -206,6 +207,8 @@ struct radv_device {
    struct vk_device vk;
    /* Shared reservation budget for persistent index-route storage. */
    uint32_t bc250_idx_storage_bytes;
+   /* Its limit and the spare list's (radv_bc250_device_env_init). */
+   uint32_t bc250_idx_storage_limit, bc250_idx_spare_limit;
    /* Index-route storage returned by reset or destroyed command buffers, reused by the next recording (counted in
     * the reservation budget while kept here). */
    simple_mtx_t bc250_idx_spare_mtx;
