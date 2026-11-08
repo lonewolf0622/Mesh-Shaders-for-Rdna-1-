@@ -29866,6 +29866,148 @@ index 0000000..dc6e47d
 + gl_MeshVerticesEXT[i].gl_Position=vec4(float(i%16u)/8.0-1.0+shift,float(i/16u)/8.0-1.0,0.5,1);
 + if(i<64u){ gl_PrimitiveTriangleIndicesEXT[i]=uvec3(i,(i+1u)%128u,(i+2u)%128u); pcol[i]=vec4(float(gl_ViewIndex),float(pl.base),1,1); }
 +}
+diff --git a/tests/bc250-mesh/split-admission/mesh_only_ballot.mesh b/tests/bc250-mesh/split-admission/mesh_only_ballot.mesh
+new file mode 100644
+index 0000000..2aefd79
+--- /dev/null
++++ b/tests/bc250-mesh/split-admission/mesh_only_ballot.mesh
+@@ -0,0 +1,31 @@
++#version 460
++#extension GL_EXT_mesh_shader : require
++#extension GL_KHR_shader_subgroup_ballot : require
++// Mesh-only, wave32-sized, V=128 P=64, ten vertex outputs, subgroup ballot, WorkGroupID and NumWorkGroups.
++// It fits the Mesh route, so RADV_BC250_MESH_TASK_IDX=force compares the Task index route's built-in Task
++// stage against it. mesh_only_wide.mesh is the same picture with about 13 KB more shared memory.
++layout(local_size_x=32) in;
++layout(triangles, max_vertices=128, max_primitives=64) out;
++layout(location=0) flat out vec4 attr[][10];
++shared uint lut[128];
++
++void main(){
++ uint i=gl_LocalInvocationIndex;
++ uint wg=gl_WorkGroupID.x+gl_WorkGroupID.y*gl_NumWorkGroups.x;
++ uint n=gl_NumWorkGroups.x*gl_NumWorkGroups.y;
++ uint bits=subgroupBallotBitCount(subgroupBallot((i+wg)%3u==0u));
++ for(uint v=i; v<128u; v+=32u) lut[v]=v+(bits&1u);
++ barrier();
++ SetMeshOutputsEXT(128,64);
++ float tx=float(wg%8u), ty=float((wg/8u)%8u);
++ for(uint v=i; v<128u; v+=32u){
++   float col=float(v%16u), row=float(v/16u);
++   gl_MeshVerticesEXT[v].gl_Position=vec4((tx+col/8.0)/4.0-1.0,(ty+row/4.0)/4.0-1.0,0.5,1);
++   for(uint k=0u; k<10u; k++)
++     attr[v][k]=vec4(float(wg)/float(n),float(bits)/32.0,float(lut[v]-v),float(k)/10.0)*0.1;
++ }
++ for(uint p=i; p<64u; p+=32u){
++   uint q=p/2u, qx=q%8u, qy=q/8u, a=qy*16u+qx;
++   gl_PrimitiveTriangleIndicesEXT[p]=(p&1u)==0u?uvec3(a,a+1u,a+16u):uvec3(a+1u,a+17u,a+16u);
++ }
++}
+diff --git a/tests/bc250-mesh/split-admission/mesh_only_ssbo.frag b/tests/bc250-mesh/split-admission/mesh_only_ssbo.frag
+new file mode 100644
+index 0000000..c7a0eff
+--- /dev/null
++++ b/tests/bc250-mesh/split-admission/mesh_only_ssbo.frag
+@@ -0,0 +1,4 @@
++#version 460
++layout(location=0) flat in vec4 attr[10];
++layout(location=0) out vec4 o;
++void main(){ vec4 s=vec4(0); for(int k=0;k<10;k++) s+=attr[k]; o=s; }
+diff --git a/tests/bc250-mesh/split-admission/mesh_only_ssbo.mesh b/tests/bc250-mesh/split-admission/mesh_only_ssbo.mesh
+new file mode 100644
+index 0000000..203c5d3
+--- /dev/null
++++ b/tests/bc250-mesh/split-admission/mesh_only_ssbo.mesh
+@@ -0,0 +1,39 @@
++#version 460
++#extension GL_EXT_mesh_shader : require
++#extension GL_KHR_shader_subgroup_ballot : require
++// Storage writes on the Task index route (each Mesh workgroup runs once, as on hardware), in
++// mesh_only_wide.mesh's shape:
++// The reported Mesh-only shape: V=128 P=64, 32 invocations, ten vertex outputs, subgroup ballot and about 13 KB of
++// application shared memory that stays live past the first output store, so staging cannot reuse it. No Mesh
++// route fits; the Task index route takes it behind its built-in Task stage. The scratch reads add zero, so the
++// picture equals mesh_only_ballot.mesh on the Mesh route.
++layout(local_size_x=32) in;
++layout(triangles, max_vertices=128, max_primitives=64) out;
++layout(location=0) flat out vec4 attr[][10];
++shared uint lut[128];
++shared uint scratch[3120];
++layout(set=0,binding=0,std430) buffer S { uint count; uint data[]; } s;
++
++void main(){
++ uint i=gl_LocalInvocationIndex;
++ uint wg=gl_WorkGroupID.x+gl_WorkGroupID.y*gl_NumWorkGroups.x;
++ uint n=gl_NumWorkGroups.x*gl_NumWorkGroups.y;
++ uint bits=subgroupBallotBitCount(subgroupBallot((i+wg)%3u==0u));
++ for(uint v=i; v<128u; v+=32u) lut[v]=v+(bits&1u);
++ for(uint v=i; v<3120u; v+=32u) scratch[v]=v;
++ barrier();
++ SetMeshOutputsEXT(128,64);
++ s.data[(wg*32u+i)&1023u]=i+bits;
++ if(i==0u) atomicAdd(s.count,1u);
++ float tx=float(wg%8u), ty=float((wg/8u)%8u);
++ for(uint v=i; v<128u; v+=32u){
++   float col=float(v%16u), row=float(v/16u);
++   gl_MeshVerticesEXT[v].gl_Position=vec4((tx+col/8.0)/4.0-1.0,(ty+row/4.0)/4.0-1.0,0.5,1);
++   for(uint k=0u; k<10u; k++)
++     attr[v][k]=vec4(float(wg)/float(n),float(bits)/32.0,float(lut[v]-v+scratch[(v*25u)%3120u]-(v*25u)%3120u),float(k)/10.0)*0.1;
++ }
++ for(uint p=i; p<64u; p+=32u){
++   uint q=p/2u, qx=q%8u, qy=q/8u, a=qy*16u+qx;
++   gl_PrimitiveTriangleIndicesEXT[p]=(p&1u)==0u?uvec3(a,a+1u,a+16u):uvec3(a+1u,a+17u,a+16u);
++ }
++}
+diff --git a/tests/bc250-mesh/split-admission/mesh_only_wide.frag b/tests/bc250-mesh/split-admission/mesh_only_wide.frag
+new file mode 100644
+index 0000000..c7a0eff
+--- /dev/null
++++ b/tests/bc250-mesh/split-admission/mesh_only_wide.frag
+@@ -0,0 +1,4 @@
++#version 460
++layout(location=0) flat in vec4 attr[10];
++layout(location=0) out vec4 o;
++void main(){ vec4 s=vec4(0); for(int k=0;k<10;k++) s+=attr[k]; o=s; }
+diff --git a/tests/bc250-mesh/split-admission/mesh_only_wide.mesh b/tests/bc250-mesh/split-admission/mesh_only_wide.mesh
+new file mode 100644
+index 0000000..8c64636
+--- /dev/null
++++ b/tests/bc250-mesh/split-admission/mesh_only_wide.mesh
+@@ -0,0 +1,34 @@
++#version 460
++#extension GL_EXT_mesh_shader : require
++#extension GL_KHR_shader_subgroup_ballot : require
++// The reported Mesh-only shape: V=128 P=64, 32 invocations, ten vertex outputs, subgroup ballot and about 13 KB of
++// application shared memory that stays live past the first output store, so staging cannot reuse it. No Mesh
++// route fits; the Task index route takes it behind its built-in Task stage. The scratch reads add zero, so the
++// picture equals mesh_only_ballot.mesh on the Mesh route.
++layout(local_size_x=32) in;
++layout(triangles, max_vertices=128, max_primitives=64) out;
++layout(location=0) flat out vec4 attr[][10];
++shared uint lut[128];
++shared uint scratch[3120];
++
++void main(){
++ uint i=gl_LocalInvocationIndex;
++ uint wg=gl_WorkGroupID.x+gl_WorkGroupID.y*gl_NumWorkGroups.x;
++ uint n=gl_NumWorkGroups.x*gl_NumWorkGroups.y;
++ uint bits=subgroupBallotBitCount(subgroupBallot((i+wg)%3u==0u));
++ for(uint v=i; v<128u; v+=32u) lut[v]=v+(bits&1u);
++ for(uint v=i; v<3120u; v+=32u) scratch[v]=v;
++ barrier();
++ SetMeshOutputsEXT(128,64);
++ float tx=float(wg%8u), ty=float((wg/8u)%8u);
++ for(uint v=i; v<128u; v+=32u){
++   float col=float(v%16u), row=float(v/16u);
++   gl_MeshVerticesEXT[v].gl_Position=vec4((tx+col/8.0)/4.0-1.0,(ty+row/4.0)/4.0-1.0,0.5,1);
++   for(uint k=0u; k<10u; k++)
++     attr[v][k]=vec4(float(wg)/float(n),float(bits)/32.0,float(lut[v]-v+scratch[(v*25u)%3120u]-(v*25u)%3120u),float(k)/10.0)*0.1;
++ }
++ for(uint p=i; p<64u; p+=32u){
++   uint q=p/2u, qx=q%8u, qy=q/8u, a=qy*16u+qx;
++   gl_PrimitiveTriangleIndicesEXT[p]=(p&1u)==0u?uvec3(a,a+1u,a+16u):uvec3(a+1u,a+17u,a+16u);
++ }
++}
 diff --git a/tests/bc250-mesh/split-admission/mkpipe.c b/tests/bc250-mesh/split-admission/mkpipe.c
 new file mode 100644
 index 0000000..493272d
@@ -30042,10 +30184,10 @@ index 0000000..611c5d0
 + return r?1:0;}
 diff --git a/tests/bc250-mesh/split-admission/run.sh b/tests/bc250-mesh/split-admission/run.sh
 new file mode 100755
-index 0000000..1c51889
+index 0000000..2a272e5
 --- /dev/null
 +++ b/tests/bc250-mesh/split-admission/run.sh
-@@ -0,0 +1,119 @@
+@@ -0,0 +1,129 @@
 +#!/usr/bin/env bash
 +# Split admission regression (drm-shim only, never the real GPU).
 +#
@@ -30122,15 +30264,15 @@ index 0000000..1c51889
 +numwg128|numwg128|-||0|direct mesh-only split enabled: pieces=3
 +numwg_single|numwg_single|-||0|split applied: pieces=1
 +numwg_task|numwg_task|t||0|split applied: pieces=3
-+numwg128_amplifier|numwg128|-|BC250_EXPERIMENTAL_DIRECT_SPLIT=false|-8|load_num_workgroups (internal amplifier)
++numwg128_amplifier|numwg128|-|BC250_EXPERIMENTAL_DIRECT_SPLIT=false RADV_BC250_MESH_TASK_IDX_MESH_ONLY=0|-8|load_num_workgroups (internal amplifier)
 +# class 3: write-only external atomics, first piece only
 +atomic_cull_shared64|atomic_cull_shared64|-||0|external atomics: 1 guarded to the first piece
-+atomic_used128|atomic_used128|-||-8|split rejected: external atomic result used
-+atomic_read128|atomic_read128|-||-8|split rejected: external atomic with external memory reads
++atomic_used128|atomic_used128|-|RADV_BC250_MESH_TASK_IDX_MESH_ONLY=0|-8|split rejected: external atomic result used
++atomic_read128|atomic_read128|-|RADV_BC250_MESH_TASK_IDX_MESH_ONLY=0|-8|split rejected: external atomic with external memory reads
 +# G1 probes (scratch_G1), unchanged sources
-+tri64_cull_shared|tri64_cull_shared|-||-8|split rejected: store_ssbo
-+tri256_barrier|tri256_barrier|-||-8|split rejected: store_ssbo
-+tri128_numwg|tri128_numwg|-||-8|split rejected: store_ssbo
++tri64_cull_shared|tri64_cull_shared|-|RADV_BC250_MESH_TASK_IDX_MESH_ONLY=0|-8|split rejected: store_ssbo
++tri256_barrier|tri256_barrier|-|RADV_BC250_MESH_TASK_IDX_MESH_ONLY=0|-8|split rejected: store_ssbo
++tri128_numwg|tri128_numwg|-|RADV_BC250_MESH_TASK_IDX_MESH_ONLY=0|-8|split rejected: store_ssbo
 +tri128_atomic|tri128_atomic|-||0|external atomics: 1 guarded to the first piece
 +# shared atomics whose result nothing reads: admitted (no taint reaches the primitives)
 +tri128_shatomic|tri128_shatomic|-||0|split shared atomics admitted: pieces=2
@@ -30163,6 +30305,16 @@ index 0000000..1c51889
 +feat_primid_task|feat_primid_task|t|RADV_BC250_MESH_TASK_IDX=force|0|BC250 TASK IDX: applied
 +feat_layer_task|feat_layer_task|t|RADV_BC250_MESH_TASK_IDX=force|0|BC250 TASK IDX: applied
 +feat_bary_task|feat_bary_task|t|RADV_BC250_MESH_TASK_IDX=force|0|BC250 TASK IDX: applied
++# Mesh-only pipelines without a Mesh route (reported shape: V=128 P=64, 13 KB shared, ballot, storage writes) take the
++# Task index route behind its built-in Task stage
++mesh_only_wide|mesh_only_wide|-|RADV_BC250_MESH_TASK_IDX=0|-8|BC250 MESH FAIL CLOSED
++mesh_only_wide_off|mesh_only_wide|-|RADV_BC250_MESH_TASK_IDX_MESH_ONLY=0|-8|BC250 MESH FAIL CLOSED
++mesh_only_wide_idx|mesh_only_wide|-||0|BC250 TASK IDX: applied (Mesh-only)
++mesh_only_ssbo_idx|mesh_only_ssbo|-||0|BC250 TASK IDX: applied (Mesh-only)
++# rows above with RADV_BC250_MESH_TASK_IDX_MESH_ONLY=0 check the Mesh route's decision; by default such shapes render here
++atomic_used128_idx|atomic_used128|-||0|BC250 TASK IDX: applied (Mesh-only)
++# explicit (aliasing) shared layouts stay refused: the index pass cannot place its own shared variables beside them
++explicit_layout128_idx|explicit_layout128|-||-8|BC250 TASK IDX: declined (explicit shared memory layout)
 +EOF
 +exit $fail
 diff --git a/tests/bc250-mesh/split-admission/shared_barrier256.mesh b/tests/bc250-mesh/split-admission/shared_barrier256.mesh
@@ -33430,11 +33582,11 @@ index 0000000..fa88426
 +}
 diff --git a/tests/bc250-mesh/task-idx/README.md b/tests/bc250-mesh/task-idx/README.md
 new file mode 100644
-index 0000000..aa1f4a3
+index 0000000..6552ece
 --- /dev/null
 +++ b/tests/bc250-mesh/task-idx/README.md
-@@ -0,0 +1,69 @@
-+# Task index route (`RADV_BC250_MESH_TASK_IDX`, opt-in)
+@@ -0,0 +1,86 @@
++# Task index route (`RADV_BC250_MESH_TASK_IDX`, on by default)
 +
 +Some Task + Mesh pipelines have no protected Mesh route. The reported case: a Mesh stage with about 13 KB
 +of application shared memory, ten vertex outputs and a shared `atomicCompSwap` table. Splitting cannot
@@ -33475,6 +33627,20 @@ index 0000000..aa1f4a3
 +  `gl_Layer`/`gl_ViewportIndex` (exported by the stored vertex shader from the provoking vertex) or
 +  barycentrics (the stored triangles keep the Mesh corner order).
 +
++Mesh-only pipelines (`RADV_BC250_MESH_TASK_IDX_MESH_ONLY`, on by default with the route) take the same route
++behind a built-in Task stage: one invocation per application Mesh workgroup stores that workgroup's WorkGroupID and
++NumWorkGroups in the payload (the producer emulates the full-dispatch values) and launches one Mesh workgroup; the
++Mesh stage reads both from the payload (`radv_bc250_idx_lower_mesh_only`). This takes, for example, a V=128 P=64
++shader with 13 KB of shared memory, subgroup ballot and storage writes, which the ordinary index route refuses.
++
++Storage: each recording that uses the route holds a 16 MiB pool and its tables (about 19 MiB). The device budget is
++1 GiB on the BC-250 (GPU-only GTT, at most an eighth of it) and 128 MiB on boards with local VRAM;
++`RADV_BC250_IDX_STORAGE_MB` overrides it. When it runs out the draw is skipped with one warning that reports the
++storage in use (with the earlier 128 MiB budget, six pending recordings were enough).
++
++Shaders with an explicit (aliasing) shared-memory layout are refused: the pass's own shared variables cannot be
++placed beside them.
++
 +Reading back Mesh outputs is also handled, but valid SPIR-V never does it (VUID-StandaloneSpirv-MeshEXT-07107).
 +
 +Indirect Task draws cover the full 4,194,304 Task workgroups: Task index pipelines use larger producer
@@ -33498,17 +33664,20 @@ index 0000000..aa1f4a3
 +  checks every stored output, including the payload of the right record. `task_chain_*` runs the setup
 +  shader pass after pass and checks that every record is drawn exactly once, in order, with the pool
 +  restarted each pass.
-+- `run.py`: creates both wide fixtures as Task index pipelines and records direct and indirect draws under
++- `radv_tests` `task_mesh_only_payload_ids`: the Mesh-only lowering reads WorkGroupID and NumWorkGroups from the right
++  record's payload.
++- `run.py`: creates both wide fixtures (and the Mesh-only `mesh_only_wide` / `mesh_only_ballot`) as Task index pipelines and records direct and indirect draws under
 +  the noop shim with NIR/ACO validation and the Vulkan validation layer.
 +- `../split-admission/run.sh`: the `*_idx` rows.
 +
-+Hardware: not run yet. The first GPU gate should be one of the wide fixtures through `index_gate` on BC-250.
++Hardware: `gpu_gate.py` (kit from `make_gpu_kit.sh`). Steps 1-24 passed on BC-250 (images identical to the Mesh route).
++Steps 25-30 (Mesh-only pipelines and twelve recordings holding storage at once) have not run on hardware yet.
 diff --git a/tests/bc250-mesh/task-idx/gpu_gate.py b/tests/bc250-mesh/task-idx/gpu_gate.py
 new file mode 100644
-index 0000000..508cd71
+index 0000000..4d5ec03
 --- /dev/null
 +++ b/tests/bc250-mesh/task-idx/gpu_gate.py
-@@ -0,0 +1,176 @@
+@@ -0,0 +1,189 @@
 +#!/usr/bin/env python3
 +"""One-shot BC-250 hardware gate for the Task index route, shared atomics in the split and staging over dead
 +shared memory. Run from a kit made by make_gpu_kit.sh, on a quiet system (no game, no build).
@@ -33558,6 +33727,15 @@ index 0000000..508cd71
 +    ('22-multiview-task-idx', 'feat_view_task.mesh.spv', 'f.frag.spv', None, {'INDEX_MULTIVIEW': '1', 'RADV_BC250_MESH_TASK_IDX': 'force'}, 'BC250 TASK IDX: applied', '21-multiview-mesh-route'),
 +    ('23-compact-task-idx-direct', 'compact_task128.mesh.spv', 'f.frag.spv', None, {'RADV_BC250_MESH_TASK_IDX': '1'}, 'BC250 TASK IDX: applied', None),
 +    ('24-compact-task-idx-indirect', 'compact_task128.mesh.spv', 'f.frag.spv', 'count', {'RADV_BC250_MESH_TASK_IDX': '1'}, 'BC250 TASK IDX: applied', None),
++    # Mesh-only pipelines (no Task stage) behind the built-in Task stage. mesh_only_wide is the reported shape (13 KB
++    # shared, ballot, no Mesh route); its picture equals mesh_only_ballot on the Mesh route.
++    ('25-mesh-only-mesh-route', 'mesh_only_ballot.mesh.spv', 'mesh_only_wide.frag.spv', None, {}, '!BC250 TASK IDX: applied', None),
++    ('26-mesh-only-task-idx', 'mesh_only_ballot.mesh.spv', 'mesh_only_wide.frag.spv', None, {'RADV_BC250_MESH_TASK_IDX': 'force'}, 'BC250 TASK IDX: applied (Mesh-only)', '25-mesh-only-mesh-route'),
++    ('27-mesh-only-wide', 'mesh_only_wide.mesh.spv', 'mesh_only_wide.frag.spv', None, {}, 'BC250 TASK IDX: applied (Mesh-only)', '25-mesh-only-mesh-route'),
++    ('28-mesh-only-mesh-route-indirect', 'mesh_only_ballot.mesh.spv', 'mesh_only_wide.frag.spv', 'count', {}, '!BC250 TASK IDX: applied', None),
++    ('29-mesh-only-wide-indirect', 'mesh_only_wide.mesh.spv', 'mesh_only_wide.frag.spv', 'count', {}, 'BC250 TASK IDX: applied (Mesh-only)', '28-mesh-only-mesh-route-indirect'),
++    # Twelve recordings hold index storage at once (about 230 MiB; the old 128 MiB budget skipped draws after six).
++    ('30-storage-12-recordings', 'mesh_only_wide.mesh.spv', 'mesh_only_wide.frag.spv', None, {'INDEX_RECORDINGS': '12'}, 'BC250 TASK IDX: applied (Mesh-only)', '25-mesh-only-mesh-route'),
 +]
 +
 +
@@ -33584,7 +33762,9 @@ index 0000000..508cd71
 +    if indirect:
 +        env['INDEX_INDIRECT'] = indirect
 +    env.update(extra)
-+    cmd = [os.path.join(KIT, 'index_gate'), '--authorized-gpu-INDEX', SH(mesh), SH(frag), image, SH('t.task.spv')]
++    # Mesh-only fixtures run without a Task stage.
++    task = [] if mesh.startswith('mesh_only') else [SH('t.task.spv')]
++    cmd = [os.path.join(KIT, 'index_gate'), '--authorized-gpu-INDEX', SH(mesh), SH(frag), image, *task]
 +    log = open(log_path, 'w')
 +    log.write('$ ' + ' '.join(f'{k}={v}' for k, v in extra.items()) + ' ' + ' '.join(cmd) + '\n')
 +    proc = subprocess.Popen(cmd, env=env, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
@@ -33635,6 +33815,8 @@ index 0000000..508cd71
 +    log.close()
 +    if proc.returncode != 0 or not os.path.exists(image):
 +        return False, f'exit {proc.returncode}'
++    if 'draw skipped' in rest.decode(errors='replace'):
++        return False, 'a Task index route draw was skipped'
 +    synced_write(os.path.join(STATE, name + '.done'), time.strftime('%Y-%m-%dT%H:%M:%S\n'))
 +    return True, ''
 +
@@ -33687,10 +33869,10 @@ index 0000000..508cd71
 +    main()
 diff --git a/tests/bc250-mesh/task-idx/make_gpu_kit.sh b/tests/bc250-mesh/task-idx/make_gpu_kit.sh
 new file mode 100755
-index 0000000..55abf75
+index 0000000..0bc5da4
 --- /dev/null
 +++ b/tests/bc250-mesh/task-idx/make_gpu_kit.sh
-@@ -0,0 +1,42 @@
+@@ -0,0 +1,45 @@
 +#!/usr/bin/env bash
 +# Build a self-contained BC-250 GPU gate kit (frozen driver, shaders, index_gate, gpu_gate.py).
 +# usage: make_gpu_kit.sh <mesa build dir> <output kit dir>
@@ -33708,10 +33890,10 @@ index 0000000..55abf75
 +grep -q "$kit/driver/libvulkan_radeon.so" "$kit/driver/icd.json"
 +fx="$src/tests/bc250-mesh/split-admission"
 +for m in dedup_task128 early_scratch_task128 dedup_task128_wide_np compact_task128 feat_cull_task feat_2d_task \
-+         feat_numwg_task feat_primid_task feat_bary_task feat_layer_task feat_view_task; do
++         feat_numwg_task feat_primid_task feat_bary_task feat_layer_task feat_view_task mesh_only_ballot mesh_only_wide; do
 +   glslangValidator -S mesh --target-env vulkan1.3 -o "$kit/shaders/$m.mesh.spv" "$fx/$m.mesh" >/dev/null
 +done
-+for f in f early_scratch_task128 dedup_task128_wide_np feat_primid_task feat_bary_task; do
++for f in f early_scratch_task128 dedup_task128_wide_np feat_primid_task feat_bary_task mesh_only_wide; do
 +   glslangValidator -S frag --target-env vulkan1.3 -o "$kit/shaders/$f.frag.spv" "$fx/$f.frag" >/dev/null
 +done
 +glslangValidator -S task --target-env vulkan1.3 -o "$kit/shaders/t.task.spv" "$fx/t.task" >/dev/null
@@ -33720,14 +33902,17 @@ index 0000000..55abf75
 +chmod +x "$kit/run.py"
 +commit=$(git -C "$src" rev-parse --short HEAD)
 +cat > "$kit/README.txt" <<EOF
-+BC-250 GPU gate: Task index route, shared atomics in the split, staging over dead shared memory.
++BC-250 GPU gate: Task index route (also Mesh-only pipelines), shared atomics in the split, staging over dead
++shared memory, index storage budget.
 +Driver: source $commit, frozen copy in driver/ (the installed driver is not touched).
 +
 +Run once, on a quiet system (close games, Steam, builds):
 +    python3 $kit/run.py
 +
-+24 steps, lowest risk first, one GPU submission each; stops at the first failure. Steps 3, 4, 6 and every even step from 10 to 22 render a
-+shader through the Task index route and must match the same shader on the Mesh route pixel for pixel.
++30 steps, lowest risk first, one GPU submission each; stops at the first failure. Steps 3, 4, 6, every even step from
++10 to 22, and 26, 27, 29 and 30 render a shader through the Task index route and must match the same shader on the
++Mesh route pixel for pixel. Steps 1-24 passed on the previous driver; steps 25-30 are new (Mesh-only pipelines and
++twelve command buffers holding index storage at once).
 +If the machine freezes: reboot and send state/ (the last .log is the step that was running). Do not rerun:
 +the kit refuses to repeat a step that started and never finished.
 +EOF
@@ -33735,10 +33920,10 @@ index 0000000..55abf75
 +echo "kit: $kit"
 diff --git a/tests/bc250-mesh/task-idx/run.py b/tests/bc250-mesh/task-idx/run.py
 new file mode 100644
-index 0000000..f69f778
+index 0000000..b3a778a
 --- /dev/null
 +++ b/tests/bc250-mesh/task-idx/run.py
-@@ -0,0 +1,67 @@
+@@ -0,0 +1,72 @@
 +#!/usr/bin/env python3
 +"""RADV_BC250_MESH_TASK_IDX recording gate (noop drm-shim only, never the GPU).
 +
@@ -33777,7 +33962,10 @@ index 0000000..f69f778
 +            ('compact_task128', 'f', '1'), ('feat_2d_task', 'f', 'force'),
 +            ('feat_cull_task', 'f', 'force'), ('feat_numwg_task', 'f', 'force'),
 +            ('feat_view_task', 'f', 'force', {'INDEX_MULTIVIEW': '1'}), ('feat_primid_task', 'feat_primid_task', 'force'),
-+            ('feat_layer_task', 'f', 'force'), ('feat_bary_task', 'feat_bary_task', 'force')]
++            ('feat_layer_task', 'f', 'force'), ('feat_bary_task', 'feat_bary_task', 'force'),
++            # Mesh-only pipelines (no Task stage): the built-in Task stage carries WorkGroupID and NumWorkGroups.
++            ('mesh_only_wide', 'mesh_only_wide', '1'), ('mesh_only_ballot', 'mesh_only_wide', 'force')]
++MESH_ONLY = {'mesh_only_wide', 'mesh_only_ballot'}
 +for fixture, fragment, switch, *more in FIXTURES:
 +    mesh = spv('mesh', src / (fixture + '.mesh'), fixture + '.spv')
 +    frag = spv('frag', src / (fragment + '.frag'), fragment + '.frag.spv')
@@ -33792,7 +33980,8 @@ index 0000000..f69f778
 +        cmd = ['bwrap', '--ro-bind', '/', '/', '--dev', '/dev', '--proc', '/proc', '--tmpfs', '/tmp',
 +               '--bind', str(out), str(out), '--unshare-pid', '--die-with-parent', '--', 'env', '-i',
 +               *(f'{k}={v}' for k, v in env.items()),
-+               str(a.gate.resolve()), '--offline', str(mesh), str(frag), str(out / 'o.rgba'), str(task)]
++               str(a.gate.resolve()), '--offline', str(mesh), str(frag), str(out / 'o.rgba'),
++               *([] if fixture in MESH_ONLY else [str(task)])]
 +        r = subprocess.run(cmd, capture_output=True, timeout=300)
 +        log = r.stdout.decode() + r.stderr.decode()
 +        tag = f'{fixture}-{mode}'
@@ -33801,6 +33990,7 @@ index 0000000..f69f778
 +        assert 'NOOP_COMPLETE pixels_not_rendered' in log and 'VALIDATION_ERRORS=0' in log, tag
 +        assert not re.search(r'(?i)validation failed|ACO ERROR|Assertion|Segmentation|VALIDATION:.*Error', log), tag
 +        assert 'BC250 TASK IDX: applied' in log and 'draw skipped' not in log, tag
++        assert (fixture in MESH_ONLY) == ('BC250 TASK IDX: applied (Mesh-only)' in log), tag
 +        passes = len(re.findall(r'^BC250 TASK IDX: pass ', log, re.M))
 +        assert passes > 0, tag
 +        rows += 1
