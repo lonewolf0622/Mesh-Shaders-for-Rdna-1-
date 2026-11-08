@@ -4,16 +4,19 @@ Mesh shader support for the AMD BC-250 (GFX1013, RDNA1-based) in Mesa's RADV Vul
 a **safe direct path**: no split/replay, one launch per Mesh workgroup, and built-in protection against the index
 patterns that hang this chip.
 
-**Development update:** this tree combines v1.3.1's GTT storage fix and inline restore check with the
-shared Mesh contract, automatic stored-output IDX routing and the RDNA 1 port. DirectMesh activates automatically
-on BC-250 and Navi 10/12/14. RDNA 1 has CPU compiler/recording validation only; rendering and performance still
-need testing on those cards. See [current status](docs/directmesh-defaults.md).
+**v1.4:** Mesh shaders that DirectMesh used to refuse (the game then drew nothing for those objects) now render.
+Task + Mesh pipelines that no Mesh route can take run as the **Task index route**: the Task stage as a compute
+producer, the Mesh stage as a compute pass that stores its outputs, drawn by an ordinary vertex pipeline. It handles
+large shared memory, shared atomics, primitive compaction, `gl_CullPrimitiveEXT`, multiview, fragment `gl_PrimitiveID`,
+`gl_Layer`, `gl_ViewportIndex` and barycentrics, 2D/3D workgroups and storage writes. Shared atomics are also
+admitted in the Mesh split, and over-budget shapes can stage their outputs over shared memory that is dead before the
+first output store, so more shaders stay on the Mesh route. See the [release notes](https://github.com/lonewolf0622/bc250meshtaskwork/releases/tag/directmesh-v1.4).
 
-**Stable v1.3.1 download:** [patch against stock Mesa 26.2.1](https://github.com/lonewolf0622/bc250meshtaskwork/releases/download/directmesh-v1.3.1/bc250-directmesh-mesa-26.2.1.patch)
-(also in [`patches/`](patches/) and on the [release page](https://github.com/lonewolf0622/bc250meshtaskwork/releases/tag/directmesh-v1.3.1)),
-or build this development tree directly (see Build). The stable patch does not contain the newer changes.
+**Download:** [patch against stock Mesa 26.2.1](https://github.com/lonewolf0622/bc250meshtaskwork/releases/download/directmesh-v1.4/bc250-directmesh-mesa-26.2.1.patch)
+(also in [`patches/`](patches/) and on the [release page](https://github.com/lonewolf0622/bc250meshtaskwork/releases/tag/directmesh-v1.4)),
+or build this tree directly (see Build).
 
-On BC-250 and Navi 10/12/14 it is on by default: no launch option is needed. `RADV_DIRECTMESH=0` turns it off, for
+On BC-250 and Navi 10/12 it is on by default: no launch option is needed. `RADV_DIRECTMESH=0` turns it off, for
 example for one game:
 
 ```
