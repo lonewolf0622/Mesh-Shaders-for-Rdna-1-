@@ -10,7 +10,7 @@
 # Environment: DIRECTMESH_VERSION (release tag), DIRECTMESH_PREFIX (install folder), DIRECTMESH_JOBS (build jobs).
 set -euo pipefail
 
-VERSION=${DIRECTMESH_VERSION:-directmesh-v1.4}
+VERSION=${DIRECTMESH_VERSION:-directmesh-v1.4.1}
 REPO=lonewolf0622/Mesh-Shaders-for-Rdna-1-
 PREFIX=${DIRECTMESH_PREFIX:-${XDG_DATA_HOME:-$HOME/.local/share}/directmesh}
 WORK=${XDG_CACHE_HOME:-$HOME/.cache}/directmesh-build

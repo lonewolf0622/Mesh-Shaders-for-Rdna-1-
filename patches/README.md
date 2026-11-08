@@ -1,4 +1,4 @@
-# DirectMesh v1.4 patches
+# DirectMesh v1.4.1 patches
 
 - `bc250-directmesh-mesa-26.2.1.patch`: driver changes against stock Mesa 26.2.1; apply with `git apply` or `patch -p1`.
 - `bc250-directmesh-tests.patch`: test fixtures and tools under `tests/bc250-mesh/`.

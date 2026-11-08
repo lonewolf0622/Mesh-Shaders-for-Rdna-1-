@@ -1,4 +1,4 @@
-# Task index route (`RADV_BC250_MESH_TASK_IDX`, opt-in)
+# Task index route (`RADV_BC250_MESH_TASK_IDX`, on by default)
 
 Some Task + Mesh pipelines have no protected Mesh route. The reported case: a Mesh stage with about 13 KB
 of application shared memory, ten vertex outputs and a shared `atomicCompSwap` table. Splitting cannot
@@ -39,6 +39,20 @@ slots the shader writes and runs each Mesh workgroup exactly once (in exactly on
   `gl_Layer`/`gl_ViewportIndex` (exported by the stored vertex shader from the provoking vertex) or
   barycentrics (the stored triangles keep the Mesh corner order).
 
+Mesh-only pipelines (`RADV_BC250_MESH_TASK_IDX_MESH_ONLY`, on by default with the route) take the same route
+behind a built-in Task stage: one invocation per application Mesh workgroup stores that workgroup's WorkGroupID and
+NumWorkGroups in the payload (the producer emulates the full-dispatch values) and launches one Mesh workgroup; the
+Mesh stage reads both from the payload (`radv_bc250_idx_lower_mesh_only`). This takes, for example, a V=128 P=64
+shader with 13 KB of shared memory, subgroup ballot and storage writes, which the ordinary index route refuses.
+
+Storage: each recording that uses the route holds a 16 MiB pool and its tables (about 19 MiB). The device budget is
+1 GiB on the BC-250 (GPU-only GTT, at most an eighth of it) and 128 MiB on boards with local VRAM;
+`RADV_BC250_IDX_STORAGE_MB` overrides it. When it runs out the draw is skipped with one warning that reports the
+storage in use (with the earlier 128 MiB budget, six pending recordings were enough).
+
+Shaders with an explicit (aliasing) shared-memory layout are refused: the pass's own shared variables cannot be
+placed beside them.
+
 Reading back Mesh outputs is also handled, but valid SPIR-V never does it (VUID-StandaloneSpirv-MeshEXT-07107).
 
 Indirect Task draws cover the full 4,194,304 Task workgroups: Task index pipelines use larger producer
@@ -62,8 +76,11 @@ Checks (all CPU, no GPU execution):
   checks every stored output, including the payload of the right record. `task_chain_*` runs the setup
   shader pass after pass and checks that every record is drawn exactly once, in order, with the pool
   restarted each pass.
-- `run.py`: creates both wide fixtures as Task index pipelines and records direct and indirect draws under
+- `radv_tests` `task_mesh_only_payload_ids`: the Mesh-only lowering reads WorkGroupID and NumWorkGroups from the right
+  record's payload.
+- `run.py`: creates both wide fixtures (and the Mesh-only `mesh_only_wide` / `mesh_only_ballot`) as Task index pipelines and records direct and indirect draws under
   the noop shim with NIR/ACO validation and the Vulkan validation layer.
 - `../split-admission/run.sh`: the `*_idx` rows.
 
-Hardware: not run yet. The first GPU gate should be one of the wide fixtures through `index_gate` on BC-250.
+Hardware: `gpu_gate.py` (kit from `make_gpu_kit.sh`). Steps 1-24 passed on BC-250 (images identical to the Mesh route).
+Steps 25-30 (Mesh-only pipelines and twelve recordings holding storage at once) have not run on hardware yet.
