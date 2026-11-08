@@ -222,6 +222,33 @@ radv_bc250_dgc_shader(struct radv_device *device, const struct radv_indirect_com
    return b.shader;
 }
 
+/* VRS state only matters where the hardware applies it. With the 1x1-only VRS
+ * exposure (radv_physical_device::bc250_vrs_noop) rates never reach the
+ * hardware, so they do not make the captured commands differ. */
+static bool
+bc250_dgc_vrs_inactive(const struct radv_cmd_buffer *state)
+{
+   const struct radv_device *device = radv_cmd_buffer_device(state);
+   const struct radv_cmd_state *s = &state->state;
+   return !s->render.vrs_att.iview && !s->uses_vrs_attachment && !s->force_vrs_per_vertex &&
+          !device->force_vrs_enabled && s->dynamic.vk.fsr.fragment_size.width == 1 &&
+          s->dynamic.vk.fsr.fragment_size.height == 1 &&
+          s->dynamic.vk.fsr.combiner_ops[0] == VK_FRAGMENT_SHADING_RATE_COMBINER_OP_KEEP_KHR &&
+          s->dynamic.vk.fsr.combiner_ops[1] == VK_FRAGMENT_SHADING_RATE_COMBINER_OP_KEEP_KHR;
+}
+
+/* An unsupported generated-commands shape or state skips its draws instead of
+ * failing the command buffer: VK_ERROR_FEATURE_NOT_PRESENT is not a legal
+ * vkEndCommandBuffer result and vkd3d-proton treats any error there as fatal. */
+static void
+bc250_dgc_skip(const char *why)
+{
+   static int warned;
+   if (!__atomic_exchange_n(&warned, 1, __ATOMIC_RELAXED))
+      fprintf(stderr, "radv/bc250: unsupported device-generated commands skipped (%s); "
+                      "further skips are not reported\n", why);
+}
+
 static bool
 bc250_dgc_state_valid(const struct radv_cmd_buffer *state, const VkGeneratedCommandsInfoEXT *info)
 {
@@ -238,11 +265,7 @@ bc250_dgc_state_valid(const struct radv_cmd_buffer *state, const VkGeneratedComm
        (state->vk.pool->flags & VK_COMMAND_POOL_CREATE_PROTECTED_BIT) ||
        (state->usage_flags & VK_COMMAND_BUFFER_USAGE_SIMULTANEOUS_USE_BIT) ||
        s->graphics_pipeline != radv_pipeline_to_graphics(p) || s->render.view_mask || state->gang.cs ||
-       s->render.vrs_att.iview || s->uses_vrs_attachment || s->force_vrs_per_vertex ||
-       device->force_vrs_enabled || s->dynamic.vk.fsr.fragment_size.width != 1 ||
-       s->dynamic.vk.fsr.fragment_size.height != 1 ||
-       s->dynamic.vk.fsr.combiner_ops[0] != VK_FRAGMENT_SHADING_RATE_COMBINER_OP_KEEP_KHR ||
-       s->dynamic.vk.fsr.combiner_ops[1] != VK_FRAGMENT_SHADING_RATE_COMBINER_OP_KEEP_KHR ||
+       (!radv_device_physical(device)->bc250_vrs_noop && !bc250_dgc_vrs_inactive(state)) ||
        s->active_pipeline_ace_queries || s->active_prims_xfb_queries || s->active_emulated_prims_xfb_queries ||
        s->streamout.enabled_mask || device->sqtt.bo || device->utrace.context || device->bc250_timer.enabled ||
        radv_bc250_chain_enabled(device) || device->bc250_split_batch_prep)
@@ -629,22 +652,22 @@ bc250_dgc_info_valid(const struct radv_cmd_buffer *cmd, const VkGeneratedCommand
       info->indirectAddressSize >= (uint64_t)layout->vk.stride * info->maxSequenceCount;
 }
 
-static void
+/* Returns false for an unsupported shape or state (nothing recorded, no error
+ * set); allocation failures set the command buffer error and also return false. */
+static bool
 bc250_dgc_prepare(struct radv_cmd_buffer *cmd, const VkGeneratedCommandsInfoEXT *info,
                   struct radv_cmd_buffer *state, struct bc250_dgc_program **program_out)
 {
    struct bc250_dgc_shape shape;
    if (!bc250_dgc_info_valid(state, info, &shape) || cmd->qf != RADV_QUEUE_GENERAL ||
-       cmd->vk.level != VK_COMMAND_BUFFER_LEVEL_PRIMARY) {
-      vk_command_buffer_set_error(&cmd->vk, VK_ERROR_FEATURE_NOT_PRESENT);
-      return;
-   }
+       cmd->vk.level != VK_COMMAND_BUFFER_LEVEL_PRIMARY)
+      return false;
    if (!info->maxSequenceCount)
-      return;
+      return true;
    uint8_t *snapshot = calloc(1, shape.size);
    if (!snapshot) {
       vk_command_buffer_set_error(&cmd->vk, VK_ERROR_OUT_OF_HOST_MEMORY);
-      return;
+      return false;
    }
    bool ok = true;
    for (uint32_t seq = 0; seq < info->maxSequenceCount && ok; seq++)
@@ -654,8 +677,7 @@ bc250_dgc_prepare(struct radv_cmd_buffer *cmd, const VkGeneratedCommandsInfoEXT 
       ok = radv_cmd_buffer_upload_data(cmd, shape.size, snapshot, &offset);
    if (!ok) {
       free(snapshot);
-      vk_command_buffer_set_error(&cmd->vk, VK_ERROR_FEATURE_NOT_PRESENT);
-      return;
+      return false;
    }
    VK_FROM_HANDLE(radv_indirect_command_layout, layout, info->indirectCommandsLayout);
    struct bc250_dgc_params params = {
@@ -675,7 +697,7 @@ bc250_dgc_prepare(struct radv_cmd_buffer *cmd, const VkGeneratedCommandsInfoEXT 
    free(snapshot);
    if (!program) {
       vk_command_buffer_set_error(&cmd->vk, VK_ERROR_OUT_OF_HOST_MEMORY);
-      return;
+      return false;
    }
    if (program_out)
       *program_out = program;
@@ -691,13 +713,22 @@ bc250_dgc_prepare(struct radv_cmd_buffer *cmd, const VkGeneratedCommandsInfoEXT 
    radv_CmdDispatchBase(radv_cmd_buffer_to_handle(cmd), 0, 0, 0, info->maxSequenceCount, 1, 1);
    cmd->state.cond_render.enabled = conditional;
    radv_meta_end(cmd);
+   return true;
 }
 
 void
 radv_bc250_dgc_prepare(struct radv_cmd_buffer *cmd, const VkGeneratedCommandsInfoEXT *info,
                        struct radv_cmd_buffer *state)
 {
-   bc250_dgc_prepare(cmd, info, state, NULL);
+   if (bc250_dgc_prepare(cmd, info, state, NULL) || vk_command_buffer_has_error(&cmd->vk))
+      return;
+   /* Unsupported explicit preprocess: fill the preprocess memory with one-dword
+    * NOPs, so an execute that still chains into it (its own state may pass the
+    * checks) runs no commands instead of stale memory. */
+   bc250_dgc_skip("preprocess");
+   if (info->preprocessAddress && info->preprocessSize >= 4)
+      cmd->state.flush_bits |= radv_fill_memory(cmd, info->preprocessAddress, info->preprocessSize & ~3ull,
+                                                PKT3_NOP_PAD, 0);
 }
 
 /* Query offsets for an execute of an explicit preprocess: capture again with the execution state
@@ -722,18 +753,21 @@ radv_bc250_dgc_execute(struct radv_cmd_buffer *cmd, VkBool32 preprocessed, const
 {
    struct bc250_dgc_shape shape;
    if (!bc250_dgc_info_valid(cmd, info, &shape)) {
-      vk_command_buffer_set_error(&cmd->vk, VK_ERROR_FEATURE_NOT_PRESENT);
+      bc250_dgc_skip("execute state or layout");
       return;
    }
    if (!info->maxSequenceCount)
       return;
    struct bc250_dgc_program *program = NULL;
-   if (!preprocessed)
-      bc250_dgc_prepare(cmd, info, cmd, &program);
-   else if (!(program = bc250_dgc_program_from_state(cmd, info, &shape)))
-      vk_command_buffer_set_error(&cmd->vk, VK_ERROR_FEATURE_NOT_PRESENT);
+   bool prepared = preprocessed ? (program = bc250_dgc_program_from_state(cmd, info, &shape)) != NULL
+                                : bc250_dgc_prepare(cmd, info, cmd, &program);
    if (vk_command_buffer_has_error(&cmd->vk)) {
       free(program);
+      return;
+   }
+   if (!prepared) {
+      free(program);
+      bc250_dgc_skip("execute capture");
       return;
    }
    struct radv_device *device = radv_cmd_buffer_device(cmd);
@@ -772,7 +806,7 @@ radv_bc250_dgc_execute(struct radv_cmd_buffer *cmd, VkBool32 preprocessed, const
    const bool patched = bc250_dgc_patch_queries(cmd, info, &shape, program);
    free(program);
    if (!patched) {
-      vk_command_buffer_set_error(&cmd->vk, VK_ERROR_FEATURE_NOT_PRESENT);
+      bc250_dgc_skip("query program mismatch");
       return;
    }
    cmd->state.flush_bits |= RADV_CMD_FLAG_WB_L2 | RADV_CMD_FLAG_INV_L2;

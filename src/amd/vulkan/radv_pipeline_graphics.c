@@ -3868,11 +3868,9 @@ radv_graphics_pipeline_compile(struct radv_graphics_pipeline *pipeline, const Vk
       async_job->skip_shaders_cache = skip_shaders_cache;
       async_job->gfx_state = gfx_state->key.gfx_state;
       util_queue_fence_init(&async_job->fence);
+      /* Queued by radv_graphics_pipeline_create once the pipeline is fully initialized: the worker
+       * copies the whole pipeline for the cache entry and must not race with the rest of creation. */
       pipeline->bc250_async = async_job;
-      util_queue_add_job(&device->bc250_async_queue, async_job, &async_job->fence, radv_bc250_async_execute, NULL, 0);
-      if (getenv("BC250_TRACE_COMPILE"))
-         fprintf(stderr, "BC250 ASYNC COMPILE: quick binaries bound, optimized queued (stages 0x%x)\n",
-                 async_job->stage_mask);
    } else if (!skip_shaders_cache) {
       radv_pipeline_cache_insert(device, cache, &pipeline->base);
    }
@@ -4404,6 +4402,15 @@ radv_graphics_pipeline_create(VkDevice _device, VkPipelineCache _cache, const Vk
       radv_bc250_idx_create(device, pipeline, pCreateInfo);
 
    radv_pipeline_report_pso_history(device, &pipeline->base);
+
+   /* RADV_BC250_ASYNC_COMPILE: start the optimized compile only now that creation is complete. */
+   if (pipeline->bc250_async) {
+      struct radv_bc250_async_job *job = pipeline->bc250_async;
+      util_queue_add_job(&device->bc250_async_queue, job, &job->fence, radv_bc250_async_execute, NULL, 0);
+      if (getenv("BC250_TRACE_COMPILE"))
+         fprintf(stderr, "BC250 ASYNC COMPILE: quick binaries bound, optimized queued (stages 0x%x)\n",
+                 job->stage_mask);
+   }
 
    *pPipeline = radv_pipeline_to_handle(&pipeline->base);
    radv_rmv_log_graphics_pipeline_create(device, &pipeline->base, pipeline->base.is_internal);

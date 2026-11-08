@@ -16,7 +16,8 @@ def run(args,log,env=base):
  return text
 run(['cc','-O1','-Wall','-o',out/'pipe',src/'tests/bc250-mesh/dgc/pipe.c','-lvulkan'],'build.log')
 run(['cc','-O1','-Wall','-o',out/'exposure',src/'tests/bc250-mesh/dgc/exposure.c','-lvulkan'],'exposure-build.log')
-for directmesh, switch, expected in (('0',None,0),('1',None,1),('1','0',0),('1','1',1)):
+# RADV_DIRECTMESH=0 is stock RADV, which exposes its own DGC; the DirectMesh switch only applies with DirectMesh.
+for directmesh, switch, expected in (('0',None,1),('1',None,1),('1','0',0),('1','1',1)):
  e=dict(base,RADV_DIRECTMESH=directmesh)
  if switch is None:e.pop('RADV_BC250_EXPOSE_DGC')
  else:e['RADV_BC250_EXPOSE_DGC']=switch
@@ -53,11 +54,14 @@ for name,defs,task in fixtures:
   print(name,variant,'PASS',flush=True)
 print('DGC suite PASS',len(rows),'routes',sum(r['cpu_cases'] for r in rows),'CPU cases',flush=True)
 
-# The capture scratch ABI is not admitted for concurrent reuse. Recording must
-# return FEATURE_NOT_PRESENT rather than passing through to generic native PM4.
+# The capture scratch ABI is not admitted for concurrent reuse. The execute is
+# skipped (one warning) rather than passing through to generic native PM4, and the
+# command buffer stays valid: FEATURE_NOT_PRESENT is not a legal vkEndCommandBuffer
+# result and vkd3d-proton treats any error there as fatal.
 e=dict(base,DGC_REJECT_SIMULT='1')
 p=subprocess.run([str(out/'pipe'),str(out/'plain/mesh.spv'),str(out/'plain/frag.spv'),'-','1'],env=e,capture_output=True,text=True)
 text=p.stdout+p.stderr;(out/'refuse-simultaneous.log').write_text(text)
-assert p.returncode==1 and 'FAIL vkEndCommandBuffer(cb) = -8' in text and 'SUBMIT_OK' not in text,text[-3000:]
+assert 'FAIL vkEndCommandBuffer' not in text and 'DGC_ERROR' not in text,text[-3000:]
+assert text.count('unsupported device-generated commands skipped') == 1,text[-3000:]
 assert 'raw_unproven' not in text and 'Assertion' not in text
-print('DGC concurrent reuse fail-closed PASS',flush=True)
+print('DGC concurrent reuse skipped PASS rc=%d'%p.returncode,flush=True)
