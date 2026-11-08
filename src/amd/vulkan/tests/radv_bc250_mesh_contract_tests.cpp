@@ -513,7 +513,7 @@ protected:
    nir_def *table_swap(unsigned base = 0)
    {
       return nir_shared_atomic_swap(b, 32, nir_imul_imm(b, lane_in(128), 4), nir_imm_int(b, 0), lane(),
-                                    .base = base, .atomic_op = nir_atomic_op_cmpxchg);
+                                    .base = (int)base, .atomic_op = nir_atomic_op_cmpxchg);
    }
 
    void store_indices(nir_def *slot, nir_def *value)
@@ -625,4 +625,96 @@ TEST_F(radv_bc250_split_atomic_test, loop_count_refused)
    nir_set_vertex_and_primitive_count(b, nir_imm_int(b, 128), nir_umin_imm(b, nir_load_var(b, n), 64),
                                       nir_imm_int(b, 0));
    EXPECT_STREQ(hazard(), "shared atomics reach the primitive count");
+}
+
+/* radv_bc250_staging_alias_analyze: shared bytes still used at or after the first output store. */
+class radv_bc250_staging_alias_test : public radv_bc250_mesh_contract_test {
+protected:
+   radv_bc250_staging_alias_test() { b->shader->info.shared_size = 16384; }
+
+   nir_def *lane() { return nir_umin_imm(b, nir_load_local_invocation_index(b), 127); }
+   void barrier()
+   {
+      nir_barrier(b, .execution_scope = SCOPE_WORKGROUP, .memory_scope = SCOPE_WORKGROUP,
+                  .memory_semantics = NIR_MEMORY_ACQ_REL, .memory_modes = nir_var_mem_shared);
+   }
+};
+
+TEST_F(radv_bc250_staging_alias_test, early_scratch_is_free)
+{
+   /* scratch [0, 15360) used before the outputs, table [15360, 15872) read while writing them. */
+   nir_store_shared(b, lane(), nir_imul_imm(b, lane(), 4), .base = 0);
+   barrier();
+   nir_def *value = nir_load_shared(b, 1, 32, nir_imul_imm(b, lane(), 4), .base = 0);
+   barrier();
+   allocation();
+   nir_push_if(b, nir_ine_imm(b, value, 0)); /* the first output store's top-level node */
+   position(lane(), nir_vec4(b, nir_u2f32(b, nir_load_shared(b, 1, 32, nir_imul_imm(b, lane(), 4), .base = 15360)),
+                             nir_imm_float(b, 0), nir_imm_float(b, 0), nir_imm_float(b, 1)));
+   nir_pop_if(b, NULL);
+   nir_validate_shader(b->shader, "alias");
+   struct radv_bc250_staging_alias alias;
+   ASSERT_TRUE(radv_bc250_staging_alias_analyze(b->shader, &alias));
+   EXPECT_NE(alias.boundary, nullptr);
+   EXPECT_TRUE(radv_bc250_staging_alias_free(&alias, 0, 15360));
+   EXPECT_FALSE(radv_bc250_staging_alias_free(&alias, 15360, 15364));
+   EXPECT_FALSE(radv_bc250_staging_alias_free(&alias, 15868, 15872));
+}
+
+TEST_F(radv_bc250_staging_alias_test, load_before_first_store_is_free)
+{
+   /* The load runs before the first output store; only its value is used after it. */
+   nir_store_shared(b, lane(), nir_imul_imm(b, lane(), 4), .base = 0);
+   barrier();
+   allocation();
+   position(lane(), nir_vec4(b, nir_u2f32(b, nir_load_shared(b, 1, 32, nir_imul_imm(b, lane(), 4), .base = 0)),
+                             nir_imm_float(b, 0), nir_imm_float(b, 0), nir_imm_float(b, 1)));
+   struct radv_bc250_staging_alias alias;
+   ASSERT_TRUE(radv_bc250_staging_alias_analyze(b->shader, &alias));
+   EXPECT_NE(alias.boundary_instr, nullptr);
+   EXPECT_TRUE(radv_bc250_staging_alias_free(&alias, 0, 16384));
+}
+
+TEST_F(radv_bc250_staging_alias_test, access_after_first_store_is_reserved)
+{
+   nir_store_shared(b, lane(), nir_imul_imm(b, lane(), 4), .base = 0);
+   barrier();
+   allocation();
+   position(lane(), nir_imm_vec4(b, 0, 0, 0, 1));
+   position(lane(), nir_vec4(b, nir_u2f32(b, nir_load_shared(b, 1, 32, nir_imul_imm(b, lane(), 4), .base = 0)),
+                             nir_imm_float(b, 0), nir_imm_float(b, 0), nir_imm_float(b, 1)));
+   struct radv_bc250_staging_alias alias;
+   ASSERT_TRUE(radv_bc250_staging_alias_analyze(b->shader, &alias));
+   EXPECT_FALSE(radv_bc250_staging_alias_free(&alias, 0, 4));
+   EXPECT_FALSE(radv_bc250_staging_alias_free(&alias, 508, 512));
+   EXPECT_TRUE(radv_bc250_staging_alias_free(&alias, 512, 16384));
+}
+
+TEST_F(radv_bc250_staging_alias_test, unbounded_late_access_reserves_everything)
+{
+   nir_def *index = nir_channel(b, nir_load_workgroup_id(b), 0); /* no upper bound */
+   allocation();
+   position(lane(), nir_imm_vec4(b, 0, 0, 0, 1));
+   position(lane(), nir_vec4(b, nir_u2f32(b, nir_load_shared(b, 1, 32, nir_imul_imm(b, index, 4), .base = 0)),
+                             nir_imm_float(b, 0), nir_imm_float(b, 0), nir_imm_float(b, 1)));
+   struct radv_bc250_staging_alias alias;
+   ASSERT_TRUE(radv_bc250_staging_alias_analyze(b->shader, &alias));
+   EXPECT_FALSE(radv_bc250_staging_alias_free(&alias, 0, 4));
+   EXPECT_FALSE(radv_bc250_staging_alias_free(&alias, 16380, 16384));
+}
+
+TEST_F(radv_bc250_staging_alias_test, output_store_inside_loop_bounds_at_the_loop)
+{
+   nir_store_shared(b, lane(), nir_imul_imm(b, lane(), 4), .base = 4096);
+   allocation();
+   nir_loop *loop = nir_push_loop(b);
+   position(lane(), nir_vec4(b, nir_u2f32(b, nir_load_shared(b, 1, 32, nir_imul_imm(b, lane(), 4), .base = 4096)),
+                             nir_imm_float(b, 0), nir_imm_float(b, 0), nir_imm_float(b, 1)));
+   nir_jump(b, nir_jump_break);
+   nir_pop_loop(b, loop);
+   struct radv_bc250_staging_alias alias;
+   ASSERT_TRUE(radv_bc250_staging_alias_analyze(b->shader, &alias));
+   EXPECT_EQ(alias.boundary_instr, nullptr); /* the barrier goes before the loop */
+   EXPECT_TRUE(radv_bc250_staging_alias_free(&alias, 0, 4096));
+   EXPECT_FALSE(radv_bc250_staging_alias_free(&alias, 4096, 4100));
 }

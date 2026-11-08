@@ -1,0 +1,30 @@
+#version 460
+#extension GL_EXT_mesh_shader : require
+// V=160 P=128 Task + Mesh with 8 vertex outputs and about 15 KB of scratch that the
+// shader only uses before it writes outputs (values carried in registers). Over the
+// expansion's 28 KiB staging budget, but the staging arrays fit over the dead scratch.
+// The dedup table is read while writing indices, so its bytes stay reserved; it is
+// declared first, so the dead scratch ends the application region.
+layout(local_size_x=128) in;
+layout(triangles, max_vertices=160, max_primitives=128) out;
+layout(location=0) out vec4 attr[][8];
+struct P { uint base; }; taskPayloadSharedEXT P pl;
+shared uint table[160];
+shared uint scratch[3840];
+
+void main(){
+ uint i=gl_LocalInvocationIndex;
+ for(uint v=i; v<3840u; v+=128u) scratch[v]=v*3u+pl.base;
+ for(uint v=i; v<160u; v+=128u) table[v]=0u;
+ barrier();
+ for(uint v=i; v<160u; v+=128u) atomicCompSwap(table[(v*7u)%160u], 0u, v+1u);
+ uint a0=scratch[(i*7u)%3840u], a1=scratch[(i*13u+5u)%3840u];
+ barrier();
+ SetMeshOutputsEXT(160,128);
+ for(uint v=i; v<160u; v+=128u) {
+   gl_MeshVerticesEXT[v].gl_Position=vec4(float(v%16u)/8.0-1.0,float(v/16u)/10.0-1.0,0.5,1);
+   for(uint k=0u; k<8u; k++) attr[v][k]=vec4(float(v),float(k),float(a0),float(a1));
+ }
+ for(uint p=i; p<128u; p+=128u)
+   gl_PrimitiveTriangleIndicesEXT[p]=uvec3(table[p]%160u,table[p+1u]%160u,table[p+2u]%160u);
+}

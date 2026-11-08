@@ -844,3 +844,138 @@ radv_bc250_split_shared_atomic_hazard(nir_shader *mesh)
    free(t.defs);
    return failure;
 }
+
+/* Expansion staging over dead application shared memory (radv_bc250_expand_primitive_attributes).
+ *
+ * The boundary is the first top-level CF node that stores an output. Shared bytes that only nodes before it
+ * access are dead from the boundary on: with a workgroup barrier before the boundary, the output staging
+ * arrays (first written at or after it) may reuse them. Every shared access at or after the boundary keeps
+ * its bytes ([lo, hi) from the constant part of the address and nir_unsigned_upper_bound). */
+static bool
+bc250_alias_node_stores_output(nir_cf_node *node)
+{
+   bool found = false;
+   nir_foreach_block_in_cf_node(block, node) {
+      nir_foreach_instr(instr, block) {
+         if (instr->type != nir_instr_type_intrinsic)
+            continue;
+         nir_intrinsic_instr *in = nir_instr_as_intrinsic(instr);
+         if ((in->intrinsic == nir_intrinsic_store_deref || in->intrinsic == nir_intrinsic_copy_deref) &&
+             nir_deref_mode_may_be(nir_src_as_deref(in->src[0]), nir_var_shader_out))
+            found = true;
+      }
+   }
+   return found;
+}
+
+static bool
+bc250_alias_is_output_store(const nir_instr *instr)
+{
+   if (instr->type != nir_instr_type_intrinsic)
+      return false;
+   const nir_intrinsic_instr *in = nir_instr_as_intrinsic(instr);
+   return (in->intrinsic == nir_intrinsic_store_deref || in->intrinsic == nir_intrinsic_copy_deref) &&
+          nir_deref_mode_may_be(nir_src_as_deref(in->src[0]), nir_var_shader_out);
+}
+
+static bool
+bc250_alias_late_ranges(struct bc250_split_taint *t, nir_cf_node *node, const nir_instr *from,
+                        struct radv_bc250_staging_alias *alias)
+{
+   nir_foreach_block_in_cf_node(block, node) {
+      bool late = !from;
+      nir_foreach_instr(instr, block) {
+         late |= instr == from;
+         if (!late)
+            continue;
+         if (instr->type == nir_instr_type_deref) {
+            if (nir_deref_mode_may_be(nir_instr_as_deref(instr), nir_var_mem_shared))
+               return false; /* not lowered to explicit offsets: unknown bytes */
+            continue;
+         }
+         if (instr->type == nir_instr_type_call)
+            return false;
+         if (instr->type != nir_instr_type_intrinsic)
+            continue;
+         nir_intrinsic_instr *in = nir_instr_as_intrinsic(instr);
+         uint32_t lo, hi;
+         switch (in->intrinsic) {
+         case nir_intrinsic_load_shared:
+            bc250_shared_range(t, in, &in->src[0], in->def.num_components * in->def.bit_size / 8, &lo, &hi);
+            break;
+         case nir_intrinsic_shared_atomic:
+         case nir_intrinsic_shared_atomic_swap:
+            bc250_shared_range(t, in, &in->src[0], in->def.bit_size / 8, &lo, &hi);
+            break;
+         case nir_intrinsic_store_shared:
+            bc250_shared_range(t, in, &in->src[1], in->src[0].ssa->num_components * in->src[0].ssa->bit_size / 8,
+                               &lo, &hi);
+            break;
+         default:
+            if (strstr(nir_intrinsic_infos[in->intrinsic].name, "shared"))
+               return false; /* another shared access form: unknown bytes */
+            continue;
+         }
+         if (alias->num_ranges == ARRAY_SIZE(alias->ranges))
+            return false;
+         alias->ranges[alias->num_ranges][0] = lo;
+         alias->ranges[alias->num_ranges][1] = hi;
+         alias->num_ranges++;
+      }
+   }
+   return true;
+}
+
+bool
+radv_bc250_staging_alias_analyze(nir_shader *mesh, struct radv_bc250_staging_alias *alias)
+{
+   memset(alias, 0, sizeof(*alias));
+   nir_function_impl *impl = nir_shader_get_entrypoint(mesh);
+   if (!impl || !mesh->info.shared_size)
+      return false;
+   nir_cf_node *boundary = NULL;
+   foreach_list_typed (nir_cf_node, node, node, &impl->body) {
+      if (bc250_alias_node_stores_output(node)) {
+         boundary = node;
+         break;
+      }
+   }
+   if (!boundary)
+      return false;
+   /* A top-level block: the boundary is right before its first output store. */
+   nir_instr *first_store = NULL;
+   if (boundary->type == nir_cf_node_block) {
+      nir_foreach_instr(instr, nir_cf_node_as_block(boundary)) {
+         if (bc250_alias_is_output_store(instr)) {
+            first_store = instr;
+            break;
+         }
+      }
+   }
+   /* Nothing runs before the first output store: nothing to reuse. */
+   const bool first_node = boundary == exec_node_data(nir_cf_node, exec_list_get_head(&impl->body), node);
+   if (first_node && (!first_store || first_store == nir_block_first_instr(nir_cf_node_as_block(boundary))))
+      return false;
+   struct bc250_split_taint t = {.shader = mesh, .range_ht = _mesa_pointer_hash_table_create(NULL)};
+   bool ok = true;
+   for (nir_cf_node *node = boundary; node && ok; node = nir_cf_node_next(node))
+      ok = bc250_alias_late_ranges(&t, node, node == boundary ? first_store : NULL, alias);
+   _mesa_hash_table_destroy(t.range_ht, NULL);
+   if (!ok) {
+      memset(alias, 0, sizeof(*alias));
+      return false;
+   }
+   alias->boundary = boundary;
+   alias->boundary_instr = first_store;
+   return true;
+}
+
+bool
+radv_bc250_staging_alias_free(const struct radv_bc250_staging_alias *alias, uint32_t lo, uint32_t hi)
+{
+   for (unsigned i = 0; i < alias->num_ranges; i++) {
+      if (lo < alias->ranges[i][1] && alias->ranges[i][0] < hi)
+         return false;
+   }
+   return true;
+}

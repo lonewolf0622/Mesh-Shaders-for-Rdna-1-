@@ -91,6 +91,19 @@ bool radv_bc250_mesh_allocation_is_canonical(const struct radv_bc250_mesh_contra
  * reason. Re-indexes SSA defs; does not change instructions. */
 const char *radv_bc250_split_shared_atomic_hazard(nir_shader *mesh);
 
+/* Expansion staging over dead application shared memory: boundary is the first top-level CF node that
+ * stores an output (NULL: no reuse); ranges are the shared bytes any access at or after it may touch. */
+struct radv_bc250_staging_alias {
+   nir_cf_node *boundary;
+   /* When the boundary node is a block: its first output store (the boundary is right before it). */
+   nir_instr *boundary_instr;
+   unsigned num_ranges;
+   uint32_t ranges[256][2];
+};
+bool radv_bc250_staging_alias_analyze(nir_shader *mesh, struct radv_bc250_staging_alias *alias);
+/* [lo, hi) is not touched at or after the boundary. */
+bool radv_bc250_staging_alias_free(const struct radv_bc250_staging_alias *alias, uint32_t lo, uint32_t hi);
+
 #ifdef __cplusplus
 }
 #endif

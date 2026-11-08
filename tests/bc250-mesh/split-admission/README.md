@@ -59,6 +59,30 @@ LDS window, not the split, and needs a different route.
 
 Older rows of `run.sh` print trace messages that predate the current driver; their results match `975ec91`.
 
+## Staging over dead shared memory (class 5)
+
+The expansion copies every output array into shared memory and refuses when application shared memory plus
+those staging arrays exceed 28 KiB. When the budget is exceeded, it now tries to reuse application shared
+memory that is dead before the first output store (`radv_bc250_staging_alias_analyze`, `bc250_staging_alias_*`):
+
+- **Boundary:** the first top-level node that stores an output, or, in a straight-line top-level block, that
+  block's first output store.
+- **Reserved bytes:** every shared access at or after the boundary keeps its bytes. Ranges use the constant part
+  of the address and `nir_unsigned_upper_bound`. An unbounded access keeps everything.
+- **Layout:** staging arrays are split per inner element (`nir_split_array_vars`) and placed largest first into
+  free bytes, possibly continuing past the application region. Variables that code before the boundary touches
+  (the primitive count) stay outside the reused bytes.
+- **Synchronization:** a workgroup barrier at the boundary makes every invocation finish with the old contents
+  first.
+
+Shaders within the budget keep their exact layout.
+
+| Case | Before | Now |
+|---|---|---|
+| early_scratch_task128 (V=160 P=128, 8 outputs, 15 KB scratch used before the outputs) | -8 vertex expansion unavailable | 0, Mesh route, 15360 bytes reused, 24.7 KB LDS |
+| early_scratch_end_task128 (same, other declaration order) | -8 | 0 (Mesa lays out the variables itself) |
+| dedup_task128_wide_np (scratch read while writing outputs) | -8 | -8 (the bytes stay live; Task index route with the switch) |
+
 ## Results
 
 These results use the the base driver launcher policy, run in bwrap with `/dev/dri` hidden under the noop drm-shim (GFX1013), with `NIR_DEBUG=validate ACO_DEBUG=validateir,validatera`. Pipelines are created and a draw is recorded. Nothing is ever submitted.

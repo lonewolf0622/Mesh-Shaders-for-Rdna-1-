@@ -1,0 +1,29 @@
+#version 460
+#extension GL_EXT_mesh_shader : require
+// Shape of the refused NX2navi pipelines: Task + Mesh, 128 lanes (several waves: the atomics survive; one-wave workgroups get them folded into scans), V=128 P=64,
+// one per-primitive output, vertex dedup through a shared atomicCompSwap table.
+// With about 13 KB of shared memory and 10 vertex outputs, like the reported shapes; no per-primitive attributes (only indices, as reported).
+layout(local_size_x=128) in;
+layout(triangles, max_vertices=128, max_primitives=64) out;
+
+layout(location=1) out vec4 attr[][10];
+struct P { uint base; }; taskPayloadSharedEXT P pl;
+shared uint table[128];
+shared uint scratch[3120]; // about 13 KB of application shared memory, as in the report
+
+void main(){
+ uint i=gl_LocalInvocationIndex;
+ for(uint v=i; v<128u; v+=128u) table[v]=0u;
+ for(uint v=i; v<3120u; v+=128u) scratch[v]=v;
+ barrier();
+ for(uint v=i; v<128u; v+=128u) atomicCompSwap(table[(v*7u)%128u], 0u, v+1u);
+ barrier();
+ SetMeshOutputsEXT(128,64);
+ for(uint v=i; v<128u; v+=128u) for(uint k=0u; k<10u; k++) attr[v][k]=vec4(float(v),float(k),float(table[v]),1);
+ for(uint v=i; v<128u; v+=128u) gl_MeshVerticesEXT[v].gl_Position=vec4(float(v%16u)/8.0-1.0,float(v/16u)/8.0-1.0,0.5,1);
+ for(uint p=i; p<64u; p+=128u) {
+   uint a=table[p]%128u, b=table[p+1u]%128u, c=table[p+2u]%128u;
+   gl_PrimitiveTriangleIndicesEXT[p]=uvec3(a,b,c);
+
+ }
+}

@@ -2036,6 +2036,177 @@ bc250_compact_written_elements(nir_function_impl *impl, nir_variable *var)
    return mask;
 }
 
+/* Expansion staging over dead application shared memory: the lowest offset for [size, align) that no access
+ * at or after the alias boundary touches and no earlier placement took. Arrays may start in dead application
+ * bytes and continue past the application region (nothing else is placed there before them). */
+static uint32_t
+bc250_staging_alias_first_fit(const struct radv_bc250_staging_alias *alias, uint32_t (*placed)[2],
+                              unsigned num_placed, uint32_t size, uint32_t align)
+{
+   uint32_t candidates[256 + 129];
+   unsigned n = 0;
+   candidates[n++] = 0;
+   for (unsigned i = 0; i < alias->num_ranges; i++)
+      candidates[n++] = alias->ranges[i][1];
+   for (unsigned i = 0; i < num_placed; i++)
+      candidates[n++] = placed[i][1];
+   uint32_t best = UINT32_MAX;
+   for (unsigned c = 0; c < n; c++) {
+      const uint64_t lo = ALIGN_POT((uint64_t)candidates[c], MAX2(align, 1));
+      if (lo >= best || lo + size > UINT32_MAX || !radv_bc250_staging_alias_free(alias, lo, lo + size))
+         continue;
+      bool clash = false;
+      for (unsigned i = 0; i < num_placed && !clash; i++)
+         clash = lo < placed[i][1] && placed[i][0] < lo + size;
+      if (!clash)
+         best = lo;
+   }
+   return best;
+}
+
+struct bc250_staging_alias_item {
+   nir_variable *var;
+   unsigned size, alignment;
+};
+
+static int
+bc250_staging_alias_larger(const void *a, const void *b)
+{
+   const struct bc250_staging_alias_item *x = a, *y = b;
+   return x->size != y->size ? (x->size < y->size ? 1 : -1) : 0;
+}
+
+/* Place the arrays largest first. Returns the end of the arrays and how many bytes of the application region
+ * they reuse; offsets go to items[i].var->data.driver_location when assign is set. */
+static uint32_t
+bc250_staging_alias_place(const struct radv_bc250_staging_alias *alias, struct bc250_staging_alias_item *items,
+                          unsigned count, unsigned application_size, bool assign, unsigned *reused)
+{
+   qsort(items, count, sizeof(*items), bc250_staging_alias_larger);
+   uint32_t placed[128][2], end = 0;
+   *reused = 0;
+   for (unsigned i = 0; i < count && i < ARRAY_SIZE(placed); i++) {
+      const uint32_t at = bc250_staging_alias_first_fit(alias, placed, i, items[i].size, items[i].alignment);
+      /* assign: the variable's offset (the budget check places sizes only). */
+      if (at == UINT32_MAX)
+         return UINT32_MAX;
+      placed[i][0] = at;
+      placed[i][1] = at + items[i].size;
+      end = MAX2(end, placed[i][1]);
+      if (at < application_size)
+         *reused += MIN2(placed[i][1], application_size) - at;
+      if (assign)
+         items[i].var->data.driver_location = at;
+   }
+   return count <= ARRAY_SIZE(placed) ? end : UINT32_MAX;
+}
+
+/* The budget check of the alias layout: the output staging arrays over dead application bytes, then the
+ * expansion's own variables after both the arrays and the application region. */
+static bool
+bc250_staging_alias_fits(const nir_shader *mesh, const struct radv_bc250_staging_alias *alias,
+                         nir_variable *const *source, unsigned count, unsigned compact_bytes)
+{
+   /* Arrays of arrays are laid out per inner element: bc250_staging_alias_layout splits them (their inner level
+    * is indexed by constants once copies are lowered). */
+   struct bc250_staging_alias_item items[128];
+   unsigned n = 0;
+   for (unsigned i = 0; i < count; i++) {
+      const struct glsl_type *type = source[i]->type, *element = glsl_get_array_element(type);
+      unsigned pieces = 1;
+      if (glsl_type_is_array(element)) {
+         pieces = glsl_get_length(element);
+         type = glsl_array_type(glsl_get_array_element(element), glsl_get_length(type), 0);
+      }
+      for (unsigned k = 0; k < pieces; k++) {
+         if (n == ARRAY_SIZE(items))
+            return false;
+         items[n].var = NULL;
+         glsl_get_explicit_type_for_size_align(type, bc250_shared_type, &items[n].size, &items[n].alignment);
+         n++;
+      }
+   }
+   unsigned reused;
+   const uint32_t arrays = bc250_staging_alias_place(alias, items, n, mesh->info.shared_size, false, &reused);
+   const uint64_t end = arrays == UINT32_MAX ? UINT64_MAX :
+      (uint64_t)ALIGN_POT(MAX2(arrays, mesh->info.shared_size), 16) + 4 + compact_bytes;
+   const bool fits = end <= 28 * 1024 && reused;
+   if (getenv("BC250_TRACE_STAGING")) {
+      fprintf(stderr, "BC250 MESH STAGING ALIAS: boundary=%s reserved:", alias->boundary_instr ? "instruction" :
+              alias->boundary->type == nir_cf_node_block ? "block" :
+              alias->boundary->type == nir_cf_node_if ? "if" : "loop");
+      for (unsigned i = 0; i < alias->num_ranges; i++)
+         fprintf(stderr, " [%u,%u)", alias->ranges[i][0], alias->ranges[i][1]);
+      fprintf(stderr, "\n");
+   }
+   if (getenv("BC250_TRACE_COMPILE"))
+      fprintf(stderr, "BC250 MESH STAGING ALIAS: %s reused_bytes=%u end=%llu application=%u\n",
+              fits ? "candidate" : "refused", reused, (unsigned long long)end, mesh->info.shared_size);
+   return fits;
+}
+
+/* Lay out the staging arrays over dead application bytes (the alias analysis), the expansion's own variables
+ * after them, and put a workgroup barrier before the boundary, so every invocation is done with those bytes
+ * before any output staging store. */
+static void
+bc250_staging_alias_layout(nir_shader *mesh, const struct radv_bc250_staging_alias *alias, unsigned application_size)
+{
+   /* Only variables that no code before the boundary touches may reuse dead application bytes (the
+    * expansion's primitive count, for example, is stored where SetMeshOutputs was). */
+   struct set *aliasable = _mesa_pointer_set_create(NULL), *early = _mesa_pointer_set_create(NULL);
+   nir_function_impl *impl = nir_shader_get_entrypoint(mesh);
+   foreach_list_typed (nir_cf_node, node, node, &impl->body) {
+      const bool last = node == alias->boundary;
+      if (last && !alias->boundary_instr)
+         break;
+      nir_foreach_block_in_cf_node(block, node) {
+         nir_foreach_instr(instr, block) {
+            if (instr == alias->boundary_instr)
+               break;
+            if (instr->type == nir_instr_type_deref && nir_instr_as_deref(instr)->deref_type == nir_deref_type_var)
+               _mesa_set_add(early, nir_instr_as_deref(instr)->var);
+         }
+      }
+      if (last)
+         break;
+   }
+   nir_foreach_variable_with_modes(var, mesh, nir_var_mem_shared) {
+      if (!_mesa_set_search(early, var))
+         _mesa_set_add(aliasable, var);
+   }
+   _mesa_set_destroy(early, NULL);
+   struct bc250_staging_alias_item items[128];
+   unsigned count = 0;
+   nir_foreach_variable_with_modes(var, mesh, nir_var_mem_shared) {
+      if (_mesa_set_search(aliasable, var) && count < ARRAY_SIZE(items)) {
+         items[count].var = var;
+         items[count].size = glsl_get_explicit_size(var->type, false);
+         items[count].alignment = MAX2(glsl_get_explicit_alignment(var->type), 4);
+         count++;
+      }
+   }
+   unsigned reused;
+   const uint32_t arrays = bc250_staging_alias_place(alias, items, count, application_size, true, &reused);
+   assert(arrays != UINT32_MAX);
+   uint32_t end = ALIGN_POT(MAX2(arrays, application_size), 16);
+   nir_foreach_variable_with_modes(var, mesh, nir_var_mem_shared) {
+      if (_mesa_set_search(aliasable, var))
+         continue;
+      const unsigned alignment = MAX2(glsl_get_explicit_alignment(var->type), 4);
+      var->data.driver_location = ALIGN_POT(end, alignment);
+      end = var->data.driver_location + glsl_get_explicit_size(var->type, false);
+   }
+   mesh->info.shared_size = end;
+   nir_builder b = nir_builder_at(alias->boundary_instr ? nir_before_instr(alias->boundary_instr)
+                                                        : nir_before_cf_node(alias->boundary));
+   nir_barrier(&b, .execution_scope = SCOPE_WORKGROUP, .memory_scope = SCOPE_WORKGROUP,
+               .memory_semantics = NIR_MEMORY_ACQ_REL, .memory_modes = nir_var_mem_shared);
+   _mesa_set_destroy(aliasable, NULL);
+   if (getenv("BC250_TRACE_COMPILE"))
+      fprintf(stderr, "BC250 MESH STAGING ALIAS: applied reused_bytes=%u shared_size=%u application=%u\n", reused,
+              mesh->info.shared_size, application_size);
+}
+
 bool
 radv_bc250_expand_primitive_attributes(nir_shader *mesh, nir_shader *fs, bool compact_policy,
                                        bool reclaim_dead_shared, unsigned direct_read, bool *over_budget,
@@ -2121,6 +2292,7 @@ radv_bc250_expand_primitive_attributes(nir_shader *mesh, nir_shader *fs, bool co
    nir_variable *source[128], *output[128], *indices = NULL, *new_indices = NULL;
    unsigned count = 0;
    unsigned staging_bytes = ALIGN_POT(mesh->info.shared_size, 16) + 4;
+   bool over = false;
    if (compact)
       staging_bytes += (logical_vertices + expanded + 1) * 4;
    nir_foreach_shader_out_variable(var, mesh) {
@@ -2146,17 +2318,30 @@ radv_bc250_expand_primitive_attributes(nir_shader *mesh, nir_shader *fs, bool co
        * only when it runs out. That ring is not validated on GFX1013, so
        * radv_graphics_shaders_compile refuses expanded shaders that need it.
        * Hellblade 2's Nanite shaders stage 18.9 KiB (26.5 KiB total LDS). */
-      if (staging_bytes > 28 * 1024) {
-         if (over_budget)
-            *over_budget = true;
-         return false;
-      }
+      if (staging_bytes > 28 * 1024)
+         over = true;
       source[count++] = var;
       if (var->data.location == VARYING_SLOT_PRIMITIVE_INDICES)
          indices = var;
    }
    if (!indices)
       return false;
+   /* Over the 28 KiB staging budget: the output staging arrays may still fit over application shared memory
+    * that is dead before the first output store (bc250_staging_alias_layout). Shaders within the budget keep
+    * their exact layout. */
+   struct radv_bc250_staging_alias *alias = NULL;
+   if (over) {
+      alias = calloc(1, sizeof(*alias));
+      if (!alias || !radv_bc250_staging_alias_analyze(mesh, alias) ||
+          !bc250_staging_alias_fits(mesh, alias, source, count, compact ? (logical_vertices + expanded + 1) * 4 : 0)) {
+         free(alias);
+         if (over_budget)
+            *over_budget = true;
+         return false;
+      }
+      /* The application's variables are lowered already; their declarations would be laid out again. */
+      NIR_PASS(_, mesh, nir_remove_dead_variables, nir_var_mem_shared, NULL);
+   }
 
    /* Compact arrays (ClipDistance/CullDistance): the elements the application writes. */
    nir_function_impl *entry = nir_shader_get_entrypoint(mesh);
@@ -2378,7 +2563,16 @@ radv_bc250_expand_primitive_attributes(nir_shader *mesh, nir_shader *fs, bool co
       };
       NIR_PASS(_, mesh, nir_remove_dead_variables, nir_var_mem_shared, &remove);
    }
+   const unsigned shared_before_layout = mesh->info.shared_size;
+   /* Alias layout: per-element staging arrays pack into the dead bytes (bc250_staging_alias_fits). */
+   if (alias)
+      NIR_PASS(_, mesh, nir_split_array_vars, nir_var_mem_shared);
    NIR_PASS(_, mesh, nir_lower_vars_to_explicit_types, nir_var_mem_shared, bc250_shared_type);
+   if (alias) {
+      bc250_staging_alias_layout(mesh, alias, shared_before_layout);
+      free(alias);
+      alias = NULL;
+   }
    if (getenv("BC250_TRACE_STAGING")) {
       /* The LDS staging layout: name@offset+bytes of every shared variable. */
       fprintf(stderr, "BC250 MESH STAGING:");
