@@ -1,36 +1,119 @@
-# bc250meshtaskwork: DirectMesh for BC-250 and RDNA 1
+# DirectMesh: Mesh shaders for AMD BC-250 and RDNA 1 on Linux
 
-Mesh shader support for the AMD BC-250 (GFX1013, RDNA1-based) in Mesa's RADV Vulkan driver, with Mesh shaders drawn on
-a **safe direct path**: no split/replay, one launch per Mesh workgroup, and built-in protection against the index
-patterns that hang this chip.
+DirectMesh adds Mesh and Task shader support (`VK_EXT_mesh_shader`) to RADV, Mesa's Vulkan driver, on GPUs that do
+not have it upstream. Games that need Mesh shaders (DirectX 12 Ultimate games through Steam/Proton, for example) can
+then run. It works with normal Steam and Proton, and it does not replace your system driver: you choose which games
+use it.
 
-**v1.4:** Mesh shaders that DirectMesh used to refuse (the game then drew nothing for those objects) now render.
-Task + Mesh pipelines that no Mesh route can take run as the **Task index route**: the Task stage as a compute
-producer, the Mesh stage as a compute pass that stores its outputs, drawn by an ordinary vertex pipeline. It handles
-large shared memory, shared atomics, primitive compaction, `gl_CullPrimitiveEXT`, multiview, fragment `gl_PrimitiveID`,
-`gl_Layer`, `gl_ViewportIndex` and barycentrics, 2D/3D workgroups and storage writes. Shared atomics are also
-admitted in the Mesh split, and over-budget shapes can stage their outputs over shared memory that is dead before the
-first output store, so more shaders stay on the Mesh route. See the [release notes](https://github.com/lonewolf0622/bc250meshtaskwork/releases/tag/directmesh-v1.4).
+**GPUs:** AMD BC-250 (tested on hardware), Navi 10 (RX 5600 XT, 5700, 5700 XT) and Navi 12 (not yet tested on
+hardware; reports welcome). Navi 14 (RX 5500, 5300) is not enabled yet. Other GPUs are not affected.
 
-**Download:** [patch against stock Mesa 26.2.1](https://github.com/lonewolf0622/bc250meshtaskwork/releases/download/directmesh-v1.4/bc250-directmesh-mesa-26.2.1.patch)
-(also in [`patches/`](patches/) and on the [release page](https://github.com/lonewolf0622/bc250meshtaskwork/releases/tag/directmesh-v1.4)),
-or build this tree directly (see Build).
+## Install
 
-On BC-250 and Navi 10/12 it is on by default: no launch option is needed. `RADV_DIRECTMESH=0` turns it off, for
-example for one game:
+Open a terminal and run:
 
 ```
-RADV_DIRECTMESH=0 %command%
+curl -fsSL https://raw.githubusercontent.com/lonewolf0622/Mesh-Shaders-for-Rdna-1-/main/install.sh | bash
 ```
 
-**v1.3.1:** fixes GPU hangs at 4K output (the index route's storage no longer competes for the BC-250's 512 MiB of
-VRAM) and turns DirectMesh on by default on a BC-250.
+That's it. The script:
 
-**v1.3:** adds indexed draws for eligible Mesh-only shaders (about 1.5-1.8x faster Mesh drawing for meshlets of
-96 vertices and more), multiview Mesh pipelines on the protected routes, plus LDS planning, LDS coverage, merged
-checks, direct primitive attributes and 65-primitive pieces. Mesh CTS: 1,902 passed, 0 failed on the BC-250.
+- installs the build packages it needs, if any are missing (it shows the command and asks first; this is the only
+  step that uses `sudo`);
+- downloads DirectMesh and builds the driver for your system (2 to 20 minutes, depending on the CPU);
+- installs it for your user in `~/.local/share/directmesh`, without touching the system driver;
+- prints the exact line to paste into Steam.
 
-## What you get
+Works on Arch, CachyOS, Manjaro, EndeavourOS, Debian, Ubuntu, Linux Mint, Pop!_OS, Fedora, Nobara and openSUSE. On
+other distributions it tells you which development packages to install. Not supported by the script: immutable
+systems (SteamOS, Bazzite, Fedora Silverblue), where it cannot install build packages, and Flatpak Steam, which cannot
+see the driver folder.
+
+## Use it in Steam
+
+Right-click the game > **Properties** > **Launch Options**, and paste the line the installer printed. It looks like
+this (with your own user name):
+
+```
+VK_DRIVER_FILES=/home/you/.local/share/directmesh/share/vulkan/icd.d/radeon_icd.x86_64.json %command%
+```
+
+The line is also saved in `~/.local/share/directmesh/vk_driver_files`.
+
+**All games at once** (and every other Vulkan program): install with `--global`, then log out and back in:
+
+```
+curl -fsSL https://raw.githubusercontent.com/lonewolf0622/Mesh-Shaders-for-Rdna-1-/main/install.sh | bash -s -- --global
+```
+
+**Programs outside Steam:** `directmesh-run <program>`.
+
+## Check that it works
+
+```
+directmesh-run vulkaninfo --summary
+```
+
+You should see your GPU and `Mesa 26.2.1`. The installer also prints `Mesh shaders: yes` at the end.
+
+## Turn it off, update, uninstall
+
+- **One game without DirectMesh:** remove the launch option, or put `RADV_DIRECTMESH=0` in front of `%command%`.
+- **Update:** run the install command again.
+- **Uninstall:**
+  ```
+  curl -fsSL https://raw.githubusercontent.com/lonewolf0622/Mesh-Shaders-for-Rdna-1-/main/install.sh | bash -s -- --uninstall
+  ```
+  Then remove the launch options you added.
+
+## Troubleshooting
+
+- **A game reports a DirectX 12 / feature level error on an RX 5700 / 5700 XT:** these cards have no ray tracing
+  hardware, and some games refuse to start without DirectX 12 Ultimate. Add `VKD3D_FEATURE_LEVEL=12_2` in front of
+  `%command%`, or `RADV_DIRECTMESH=1` to turn on RADV's (slow) emulated ray tracing.
+- **Objects missing or drawn wrong:** try `RADV_BC250_MESH_TASK_IDX=0` in front of `%command%` and report whether it
+  changes anything.
+- **The build failed:** the error and the log location are printed. Open an issue with the log attached.
+- **The game hangs the GPU:** see [If a game hangs](#if-a-game-hangs).
+
+Please report results, good or bad, in the [issues](https://github.com/lonewolf0622/Mesh-Shaders-for-Rdna-1-/issues):
+game, GPU, distribution and launch options.
+
+## Build it yourself
+
+The repository is Mesa 26.2.1 with the DirectMesh changes. Only the Vulkan driver needs to be built:
+
+```sh
+git clone https://github.com/lonewolf0622/Mesh-Shaders-for-Rdna-1-.git directmesh
+cd directmesh
+meson setup build -Dvulkan-drivers=amd -Dgallium-drivers= -Dplatforms=x11,wayland -Dbuildtype=release \
+      -Dllvm=disabled -Dvideo-codecs= -Dallow-fallback-for=libdrm
+ninja -C build src/amd/vulkan/libvulkan_radeon.so src/amd/vulkan/radeon_devenv_icd.x86_64.json
+```
+
+Then use `VK_DRIVER_FILES=$PWD/build/src/amd/vulkan/radeon_devenv_icd.x86_64.json` (keep the build folder in place).
+Each [release](https://github.com/lonewolf0622/Mesh-Shaders-for-Rdna-1-/releases) also has a patch against stock
+Mesa 26.2.1. Distribution packagers can install it as the system RADV; then nothing needs to be set.
+
+## Options
+
+DirectMesh is on by default on the supported GPUs. These go in front of `%command%`:
+
+- `RADV_DIRECTMESH=0`: turn DirectMesh off. `RADV_DIRECTMESH=1`: force it on (also reports emulated ray tracing on
+  Navi 10/12).
+- `RADV_BC250_MESH_TASK_IDX=0`: no Task index route (pipelines no Mesh route can take are refused instead).
+- `RADV_BC250_MESH_IDXPASS=0`: no indexed Mesh draws.
+- `RADV_DEBUG=nomeshshader`: hide Mesh shaders, so the game uses its non-Mesh path (for comparisons).
+
+## If a game hangs
+
+The BC-250 can lock up hard on a GPU hang. If you want to report one:
+
+1. Set the kernel parameter `amdgpu.gpu_recovery=0` (the machine then stays reachable, e.g. over SSH).
+2. Collect `dmesg` and, if possible, a `umr` wave dump.
+3. Include the game and the launch options you used.
+
+## How it works
 
 - `VK_EXT_mesh_shader` (Mesh + Task) on the BC-250, usable by D3D12 games through normal Proton / vkd3d-proton.
 - `VK_KHR_fragment_shader_barycentric`, so vkd3d-proton keeps Mesh shaders enabled in UE5 games.
@@ -53,6 +136,11 @@ checks, direct primitive attributes and 65-primitive pieces. Mesh CTS: 1,902 pas
 - **Fail closed:** a shape nothing can prove safe takes the older split/expansion path (also private corners) or, as a
   last resort, is refused at pipeline creation. It is never drawn on the unprotected raw route. Split Mesh shaders
   that write images run those writes once, in the first piece.
+- **Task index route (v1.4):** a Task + Mesh pipeline that no Mesh route can take runs the Task stage as a compute
+  producer and the Mesh stage as a compute pass that stores its outputs; an ordinary vertex pipeline draws them. It
+  handles large shared memory, shared atomics, primitive compaction, `gl_CullPrimitiveEXT`, multiview, fragment
+  `gl_PrimitiveID`, `gl_Layer`, `gl_ViewportIndex` and barycentrics, 2D/3D workgroups and storage writes. It is slower
+  than the Mesh route and only used when no Mesh route fits.
 
 ## Tested
 
@@ -100,47 +188,12 @@ Games (Steam / Proton, D3D12):
 The game figures were measured with v1.0. With v1.1, Final Fantasy VII Rebirth and Hellblade 2 compile to the same
 shaders, and Control was played again with the renumbered export.
 
-## Build
+## Version history
 
-```sh
-git clone https://github.com/lonewolf0622/bc250meshtaskwork.git
-cd bc250meshtaskwork
-meson setup build -Dvulkan-drivers=amd -Dgallium-drivers= -Dplatforms=x11,wayland \
-      -Dbuildtype=release -Dllvm=disabled -Dvideo-codecs=
-ninja -C build src/amd/vulkan/libvulkan_radeon.so src/amd/vulkan/radeon_devenv_icd.x86_64.json
-```
-
-The driver is then `build/src/amd/vulkan/libvulkan_radeon.so`. The ICD file
-`build/src/amd/vulkan/radeon_devenv_icd.x86_64.json` already points at it. This tree is Mesa 26.2.1 plus the BC-250
-work; a patch against stock Mesa 26.2.1 is provided with the releases.
-
-## Use
-
-**Without replacing your system driver** (recommended to start), point the Vulkan loader at the build. Steam
-launch options:
-
-```
-VK_DRIVER_FILES=/path/to/bc250meshtaskwork/build/src/amd/vulkan/radeon_devenv_icd.x86_64.json %command%
-```
-
-Keep the build folder in place: the ICD file points at the library inside it.
-
-**As your system driver** (after `meson install`, or through your distribution's packaging): nothing to set.
-
-On BC-250 and RDNA 1, the driver enables DirectMesh automatically. `RADV_DIRECTMESH=0` disables it;
-`RADV_DIRECTMESH=1` remains an explicit override. Individual `RADV_BC250_*` / `BC250_*` options still take priority.
-BC-250's indexed storage stays in write-combined GTT, preserving v1.3.1's 4K fix. Discrete RDNA 1 keeps that storage
-in local VRAM. Installed drivers are not changed by building this tree.
-
-Useful extras:
-
-- `RADV_DEBUG=nomeshshader`: hide Mesh shaders, so the game uses its own non-Mesh path (for comparisons).
-- `RADV_BC250_MESH_SAFE_ADAPTIVE=0`: private corners only (no shared-vertex export).
-- `RADV_BC250_MESH_SAFE_COMPACT=0`: no renumbered-vertex export.
-- `RADV_BC250_MESH_IDXPASS=0`: keep the v1.3 Mesh routes while disabling indexed Mesh draws.
-
-## Changes
-
+- **v1.4:** the Task index route (on by default), shared atomics in the Mesh split, staging over unused shared
+  memory, defaults applied per GPU instead of written into the environment, Navi 14 no longer enabled, VRS and
+  optional emulated ray tracing reported on Navi 10/12, unsupported device-generated commands skipped instead of
+  failing. See the [release notes](https://github.com/lonewolf0622/Mesh-Shaders-for-Rdna-1-/releases/tag/directmesh-v1.4).
 - **v1.3.1:** the index route's storage (index pages and indirect pools, up to 128 MiB per device) is allocated in
   GTT instead of VRAM. The BC-250's VRAM carveout is 512 MiB and the desktop alone nearly fills it, so at 4K the
   VRAM-only storage pushed the game's and the display's buffers out and the GPU could hang. GTT is the same memory on
@@ -169,14 +222,7 @@ Useful extras:
 
 - Mesh pipeline statistics queries.
 - Per-primitive shading rate from Mesh shaders.
-
-## If a game hangs
-
-The BC-250 can lock up hard on a GPU hang. If you want to report one:
-
-1. Set the kernel parameter `amdgpu.gpu_recovery=0` (the machine then stays reachable, e.g. over SSH).
-2. Collect `dmesg` and, if possible, a `umr` wave dump.
-3. Include the game and the launch options you used.
+- Device-generated commands with pipelines that need the Task index route (those draws are skipped).
 
 ## Offline tests
 
