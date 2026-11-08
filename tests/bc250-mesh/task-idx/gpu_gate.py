@@ -60,21 +60,25 @@ def run_step(name, mesh, frag, indirect, extra, marker):
     log = open(log_path, 'w')
     log.write('$ ' + ' '.join(f'{k}={v}' for k, v in extra.items()) + ' ' + ' '.join(cmd) + '\n')
     proc = subprocess.Popen(cmd, env=env, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
-    text, ready, deadline = [], False, time.time() + 300
-    while time.time() < deadline:
-        if not select.select([proc.stdout], [], [], 1)[0]:
+    # Raw reads from the pipe: a buffered reader can hold INDEX_READY while select() sees an empty pipe.
+    fd = proc.stdout.fileno()
+    text, ready, pending, deadline = [], False, b'', time.time() + 300
+    while not ready and time.time() < deadline:
+        if not select.select([fd], [], [], 1)[0]:
             if proc.poll() is not None:
                 break
             continue
-        line = proc.stdout.readline().decode(errors='replace')
-        if not line:
+        chunk = os.read(fd, 65536)
+        if not chunk:
             break
-        if not line.startswith('BC250POLICY'):
-            log.write(line)
-            text.append(line)
-        if line.startswith('INDEX_READY'):
-            ready = True
-            break
+        pending += chunk
+        while b'\n' in pending and not ready:
+            raw, pending = pending.split(b'\n', 1)
+            line = raw.decode(errors='replace') + '\n'
+            if not line.startswith('BC250POLICY'):
+                log.write(line)
+                text.append(line)
+            ready = line.startswith('INDEX_READY')
     joined = ''.join(text)
     if not ready or marker not in joined:
         proc.kill()
@@ -91,6 +95,7 @@ def run_step(name, mesh, frag, indirect, extra, marker):
     proc.stdin.close()
     try:
         rest, _ = proc.communicate(timeout=120)
+        rest = pending + rest
     except subprocess.TimeoutExpired:
         proc.kill()
         log.write('GATE: no exit within 120 s\n')
