@@ -141,16 +141,17 @@ TEST_F(radv_bc250_dispatch_test, chunk_base_recovers_full_dispatch_coordinates)
 
 TEST(radv_directmesh, hardware_scope)
 {
-   for (auto family : {CHIP_NAVI10, CHIP_NAVI12, CHIP_NAVI14, CHIP_GFX1013})
+   for (auto family : {CHIP_NAVI10, CHIP_NAVI12, CHIP_GFX1013})
       EXPECT_TRUE(radv_directmesh_family(family));
-   for (auto family : {CHIP_POLARIS10, CHIP_RENOIR, CHIP_NAVI21, CHIP_NAVI31})
+   /* Navi14 stays out until the Mesh-only NGG path has run on that chip. */
+   for (auto family : {CHIP_NAVI14, CHIP_POLARIS10, CHIP_RENOIR, CHIP_NAVI21, CHIP_NAVI31})
       EXPECT_FALSE(radv_directmesh_family(family));
    for (unsigned id : {0x13fe, 0x143f, 0x7310, 0x7312, 0x7318, 0x7319, 0x731a, 0x731b,
-                       0x731e, 0x731f, 0x7340, 0x7341, 0x7347, 0x734f, 0x7360, 0x7362}) {
+                       0x731e, 0x731f, 0x7360, 0x7362}) {
       EXPECT_TRUE(radv_directmesh_pci(0x1002, id));
       EXPECT_FALSE(radv_directmesh_pci(0x10de, id));
    }
-   for (unsigned id : {0x13ff, 0x7311, 0x7342, 0x7361, 0x15e7, 0x73bf, 0x744c})
+   for (unsigned id : {0x7340, 0x7341, 0x7347, 0x734f, 0x13ff, 0x7311, 0x7342, 0x7361, 0x15e7, 0x73bf, 0x744c})
       EXPECT_FALSE(radv_directmesh_pci(0x1002, id));
 }
 
@@ -164,4 +165,117 @@ TEST(radv_directmesh, activation_override)
       EXPECT_FALSE(radv_directmesh_preset("", detected));
       EXPECT_FALSE(radv_directmesh_preset("invalid", detected));
    }
+}
+
+/* The settings table must stay value-for-value identical to the preset that
+ * radv_bc250_directmesh_env() used to write with setenv() (v1.3.1 + auto IDX). */
+TEST(radv_directmesh, preset_table_matches_previous_setenv_preset)
+{
+   static const struct radv_directmesh_setting expected[] = {
+      {"RADV_BC250_NATIVE_TASK", "0"},
+      {"BC250_EXPERIMENTAL_COMPUTE_CU_MODE", "false"},
+      {"BC250_BALANCED_SLICES", "true"},
+      {"BC250_SINGLE_PIECE", "true"},
+      {"BC250_CACHE_PLAN", "true"},
+      {"BC250_TRANSIENT_ARENA", "true"},
+      {"BC250_PARALLEL_CULL", "true"},
+      {"BC250_COMPACT_VERTICES", "false"},
+      {"BC250_OUTPUT_REGIONS", "true"},
+      {"BC250_EXPERIMENTAL_ZEROED_PRIVATE_GTT", "false"},
+      {"RADV_BC250_MESH_ONCE", "false"},
+      {"BC250_EXPERIMENTAL_DIRECT_SPLIT", "true"},
+      {"BC250_EXPERIMENTAL_SKIP_INACTIVE_CHUNKS", "true"},
+      {"RADV_BC250_SPLIT_MESH", "true"},
+      {"RADV_BC250_EXPAND_PRIMITIVES", "true"},
+      {"BC250_EXPERIMENTAL_CULL_COMPACT", "true"},
+      {"BC250_EXPERIMENTAL_PACK_TRIANGLE_VERTICES", "true"},
+      {"BC250_EXPERIMENTAL_POST_MESH_VGT_FLUSH", "0"},
+      {"BC250_CAPTURE_RAW_IBS", "false"},
+      {"RADV_BC250_EXPOSE_FAST_BINDING", "1"},
+      {"RADV_BC250_SUBMIT_KNOWN_SIGNALS", "1"},
+      {"RADV_BC250_LOCAL_BOS", "1"},
+      {"RADV_BC250_KEEP_IB_KB", "640"},
+      {"RADV_BC250_PERF_PIECE_PRIMS", "64"},
+      {"RADV_BC250_SCRATCH_REUSE", "1"},
+      {"RADV_BC250_MESH_DIRECT_READ", "full"},
+      {"RADV_BC250_MESH_AUTOCULL", "1"},
+      {"RADV_BC250_MESH_AUTOCULL_WIDE", "1"},
+      {"RADV_BC250_MESH_SAFE_FAST", "1"},
+      {"RADV_BC250_MESH_SAFE_PIECES", "1"},
+      {"RADV_BC250_MESH_SAFE_OWNED", "1"},
+      {"RADV_BC250_MESH_SAFE_LOCAL", "1"},
+      {"RADV_BC250_MESH_SAFE_CHECK", "1"},
+      {"RADV_BC250_MESH_SAFE_CORNERS", "1"},
+      {"RADV_BC250_MESH_SAFE_AUTOCULL", "1"},
+      {"RADV_BC250_MESH_SAFE_PARALLEL", "1"},
+      {"RADV_BC250_MESH_SAFE_BARY", "1"},
+      {"RADV_BC250_BARY_IO16", "1"},
+      {"RADV_BC250_MESH_SAFE_BARY_TINY", "1"},
+      {"RADV_BC250_MESH_SAFE_BARY_AFFINE", "1"},
+      {"RADV_BC250_MESH_SAFE_BARY_LAST", "1"},
+      {"RADV_BC250_BARY_CORNER_ID", "1"},
+      {"RADV_BC250_MESH_ALLOW_POS1", "1"},
+      {"RADV_BC250_MESH_SPLIT_ANY", "1"},
+      {"RADV_BC250_MESH_NESTED_SLICE", "1"},
+      {"RADV_BC250_MESH_SAFE_SPLIT_PIECES", "1"},
+      {"RADV_BC250_MESH_SAFE_ADAPTIVE", "1"},
+      {"RADV_BC250_MESH_LDS_PLAN", "1"},
+      {"RADV_BC250_MESH_LDS_COVER", "1"},
+      {"RADV_BC250_MESH_MERGED_CHECK", "1"},
+      {"RADV_BC250_MESH_PP_DIRECT", "1"},
+      {"RADV_BC250_MESH_PIECES_65", "1"},
+      {"RADV_BC250_MESH_IDXPASS", "1"},
+      {"RADV_BC250_MESH_IDXPASS_STORE", "auto"},
+      {"RADV_BC250_MESH_IDXPASS_SETUP_BATCH", "1"},
+      {"RADV_BC250_MESH_FAIL_CLOSED", "1"},
+      {"RADV_BC250_MESH_DEAD_PAYLOAD", "1"},
+      {"RADV_BC250_MESH_PIECE_PRIMID", "1"},
+      {"RADV_BC250_MESH_SAFE_PIECES_EXT", "1"},
+      {"RADV_BC250_TASK_GRID_FOLD", "1"},
+      {"RADV_BC250_MESH_SAFE_COMPACT", "1"},
+      {"RADV_BC250_MESH_PP_SHARE", "1"},
+      {"RADV_BC250_MESH_LEAN_CHECK", "1"},
+      {"RADV_BC250_EXPOSE_MULTIVIEW_MESH", "1"},
+      {"RADV_BC250_MESH_SPLIT_STORES", "1"},
+      {"RADV_BC250_MESH_MULTIVIEW_VTX", "1"},
+      {"RADV_BC250_TASK_MULTIVIEW", "1"},
+      {"RADV_BC250_TASK_TAIL", "1"},
+      {"RADV_BC250_EXPOSE_DGC", "1"},
+      {"RADV_BC250_NGGC_WIDE", "1"},
+      {"RADV_BC250_DCC_32B", "1"},
+   };
+   unsigned count = 0;
+   const struct radv_directmesh_setting *table = radv_directmesh_settings_table(&count);
+   ASSERT_EQ(count, sizeof(expected) / sizeof(expected[0]));
+   for (unsigned i = 0; i < count; i++) {
+      EXPECT_STREQ(table[i].name, expected[i].name);
+      EXPECT_STREQ(table[i].value, expected[i].value);
+      EXPECT_STREQ(radv_directmesh_default(expected[i].name), expected[i].value);
+   }
+   EXPECT_EQ(radv_directmesh_default("RADV_PERFTEST"), nullptr);
+   EXPECT_EQ(radv_directmesh_default("RADV_BC250_HYBRID_TASK"), nullptr);
+   EXPECT_EQ(radv_directmesh_default("RADV_DIRECTMESH"), nullptr);
+}
+
+TEST(radv_directmesh, resolve_environment_wins)
+{
+   /* Inactive preset: only the environment counts. */
+   EXPECT_EQ(radv_directmesh_resolve(nullptr, "RADV_BC250_MESH_IDXPASS", false), nullptr);
+   EXPECT_STREQ(radv_directmesh_resolve("0", "RADV_BC250_MESH_IDXPASS", false), "0");
+   /* Active preset: the environment still wins, including an explicit 0 or empty value. */
+   EXPECT_STREQ(radv_directmesh_resolve(nullptr, "RADV_BC250_MESH_IDXPASS", true), "1");
+   EXPECT_STREQ(radv_directmesh_resolve("0", "RADV_BC250_MESH_IDXPASS", true), "0");
+   EXPECT_STREQ(radv_directmesh_resolve("", "RADV_BC250_KEEP_IB_KB", true), "");
+   EXPECT_STREQ(radv_directmesh_resolve(nullptr, "RADV_BC250_KEEP_IB_KB", true), "640");
+   /* Names outside the preset never get a value. */
+   EXPECT_EQ(radv_directmesh_resolve(nullptr, "RADV_BC250_MESH_REFERENCE", true), nullptr);
+}
+
+TEST(radv_directmesh, explicit_switch)
+{
+   EXPECT_TRUE(radv_directmesh_explicit("1"));
+   EXPECT_FALSE(radv_directmesh_explicit(nullptr));
+   EXPECT_FALSE(radv_directmesh_explicit("0"));
+   EXPECT_FALSE(radv_directmesh_explicit(""));
+   EXPECT_FALSE(radv_directmesh_explicit("true"));
 }

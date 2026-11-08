@@ -8,6 +8,7 @@
  * SPDX-License-Identifier: MIT
  */
 #include "radv_amdgpu_winsys.h"
+#include "radv_directmesh.h"
 #include "util/u_debug.h"
 #include <assert.h>
 #include <stdio.h>
@@ -270,7 +271,7 @@ radv_amdgpu_winsys_create(int fd, const struct radeon_info *info, uint64_t debug
 
    ws->perftest = perftest_flags;
    if (ws->info.family == CHIP_GFX1013) {
-      ws->bc250_keep_ib_bytes = (uint64_t)MAX2(debug_get_num_option("RADV_BC250_KEEP_IB_KB", 0), 0) * 1024;
+      ws->bc250_keep_ib_bytes = (uint64_t)MAX2(radv_dm_num("RADV_BC250_KEEP_IB_KB", 0), 0) * 1024;
       if (debug_get_bool_option("RADV_BC250_SUBMIT_PROFILE", false))
          radv_bc250_ws_prof_enabled = true;
    }

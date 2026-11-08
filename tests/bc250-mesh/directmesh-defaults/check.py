@@ -41,7 +41,8 @@ def launch(tag, gpu, command, extra=None, driver=icd):
     return log
 
 for gpu in ('gfx1013', 'gfx1013_143f', 'navi10', 'navi12', 'navi14', 'renoir', 'navi21'):
-    targeted = gpu in ('gfx1013', 'gfx1013_143f', 'navi10', 'navi12', 'navi14')
+    # Navi 14 is outside DirectMesh until the Mesh-only NGG path has run on that chip.
+    targeted = gpu in ('gfx1013', 'gfx1013_143f', 'navi10', 'navi12')
     options = [('default', {}, None), ('explicit', dict(RADV_DIRECTMESH='1'), None),
                ('disabled', dict(RADV_DIRECTMESH='0'), None),
                ('store-off', dict(RADV_BC250_MESH_IDXPASS_STORE='0'), None),
@@ -55,11 +56,15 @@ for gpu in ('gfx1013', 'gfx1013_143f', 'navi10', 'navi12', 'navi14', 'renoir', '
         log = launch(tag, gpu, [out / 'probe', *([engine] if engine else [])], extra)
         probes = [dict(re.findall(r'(\w+)=(\S+)', line)) for line in log.splitlines() if line.startswith('PROBE ')]
         assert len(probes) == 2, tag
+        # The preset is never written into the process environment.
+        envs = [dict(re.findall(r'(\w+)=(\S+)', line)) for line in log.splitlines() if line.startswith('PROBE_ENV ')]
+        assert len(envs) == 2 and all(e['perftest'] == 'unset' for e in envs), tag
         for result in probes:
             if targeted:
                 assert result['mesh'] == ('0' if label in ('disabled', 'nongg', 'nomesh') else '1'), tag
-                assert result['preset'] == ('unset' if label == 'disabled' else '1'), tag
-                assert result['store'] == ('unset' if label == 'disabled' else '0' if label == 'store-off' else 'auto'), tag
+                assert result['preset'] == 'unset', tag
+                assert result['store'] == ('0' if label == 'store-off' else 'unset'), tag
+                assert result['hybrid'] == ('0' if label == 'task-off' else '1' if label == 'dxvk-explicit-task' else 'unset'), tag
                 if label == 'dxvk':
                     assert result['task'] == '0' and result['gpl'] == '1', tag
                 if label == 'dxvk-explicit-task':
@@ -67,14 +72,20 @@ for gpu in ('gfx1013', 'gfx1013_143f', 'navi10', 'navi12', 'navi14', 'renoir', '
                 if label == 'task-off':
                     assert result['task'] == '0' and result['gpl'] == '1', tag
                 if not gpu.startswith('gfx1013'):
-                    assert result['rt'] == '0', tag
+                    # Emulated ray tracing only with an explicit RADV_DIRECTMESH=1.
+                    assert result['rt'] == ('1' if label == 'explicit' else '0'), tag
+                    assert result['vrs'] == result['mesh'], tag
+                else:
+                    assert result['vrs'] == '1', tag
             else:
                 assert result['preset'] == result['store'] == 'unset' and result['gpl'] == '1', tag
+                if gpu == 'navi14':
+                    assert result['mesh'] == '0', tag
         rows.append(dict(case=tag, kind='enumeration', instances=2))
         print('PASS', tag, flush=True)
 
 cases = automatic.CASES + automatic.SAFETY
-for gpu in ('gfx1013', 'navi10', 'navi12', 'navi14'):
+for gpu in ('gfx1013', 'navi10', 'navi12'):
     for case in cases:
         extra = dict(BC250_TRACE_COMPILE='1', BC250_TRACE_USAGE='1', BC250_IDX_TRACE='1',
                      BC250_IDX_CAPTURE_BATCH='1', BC250_CAPTURE_POLICY_SHADERS='1', RADV_DEBUG='dumpibs',

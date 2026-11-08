@@ -9,6 +9,7 @@
  */
 
 #include "meta/radv_meta.h"
+#include "radv_directmesh.h"
 #include "nir/nir.h"
 #include "nir/nir_builder.h"
 #include "nir/nir_serialize.h"
@@ -2533,7 +2534,7 @@ radv_bc250_link_bary_rotation(const struct radv_compiler_info *compiler_info, st
       const bool cid_force = debug_get_bool_option("RADV_BC250_BARY_CORNER_ID_FORCE", false);
       if ((cid_force || !radv_bc250_bary_ref_slots(nir, fs, &raw_slot, &flat_slot)) &&
           producer->stage == MESA_SHADER_MESH && producer->bc250_safe_owned &&
-          compiler_info->key.bc250_mesh_safe_corners && debug_get_bool_option("RADV_BC250_BARY_CORNER_ID", false) &&
+          compiler_info->key.bc250_mesh_safe_corners && radv_dm_bool("RADV_BC250_BARY_CORNER_ID", false) &&
           radv_bc250_bary_cid_slot(nir, fs, &cid_slot)) {
          /* RADV_BC250_BARY_CORNER_ID: one slot carries each private corner's number (0, 1, 2);
           * the fragment shader finds the raw slot holding corner 0. */
@@ -2752,12 +2753,12 @@ radv_graphics_shaders_compile(const struct radv_compiler_info *compiler_info, st
        /* RADV_BC250_MESH_SAFE_PIECES_EXT: every split piece (Task pieces included) takes the
         * private-corner export, not only pieces with barycentrics or per-primitive data. */
        (compiler_info->bc250x.safe_pieces_ext && compiler_info->key.bc250_mesh_safe_bary_last &&
-        owned_ms->bc250_split_mesh && debug_get_bool_option("RADV_BC250_MESH_SAFE_SPLIT_PIECES", false))) &&
+        owned_ms->bc250_split_mesh && radv_dm_bool("RADV_BC250_MESH_SAFE_SPLIT_PIECES", false))) &&
       owned_ms->nir->info.mesh.max_vertices_out <= 256;
    /* RADV_BC250_MESH_SAFE_SPLIT_PIECES (default 0): every split piece (Task replay or the direct
     * Mesh-only split) is its own workgroup exporting its own slice, like the one-piece case, so it
     * takes the private-corner export too; a missing fragment shader (rasterizer discard) is allowed. */
-   const bool safe_split_pieces = debug_get_bool_option("RADV_BC250_MESH_SAFE_SPLIT_PIECES", false) &&
+   const bool safe_split_pieces = radv_dm_bool("RADV_BC250_MESH_SAFE_SPLIT_PIECES", false) &&
       compiler_info->key.bc250_mesh_safe_bary_last && tiny_bary && owned_ms->bc250_split_mesh;
    const bool no_fs_ok = safe_split_pieces && !stages[MESA_SHADER_FRAGMENT].nir;
    /* RADV_BC250_MESH_SAFE_PIECES_EXT: an unsplit subgroup-free wave32 Mesh shader with 33..64 primitives
@@ -2948,7 +2949,7 @@ radv_graphics_shaders_compile(const struct radv_compiler_info *compiler_info, st
       /* RADV_BC250_MESH_SPLIT_ANY: a Mesh shader without a fragment shader (rasterizer discard)
        * expands against an empty fragment shader: no varying is read, only positions export. */
       nir_shader *bc250_empty_fs = NULL;
-      if (!stages[MESA_SHADER_FRAGMENT].nir && debug_get_bool_option("RADV_BC250_MESH_SPLIT_ANY", false))
+      if (!stages[MESA_SHADER_FRAGMENT].nir && radv_dm_bool("RADV_BC250_MESH_SPLIT_ANY", false))
          bc250_empty_fs = nir_builder_init_simple_shader(MESA_SHADER_FRAGMENT, bc250_mesh->options,
                                                          "bc250_empty_fs").shader;
       bool bc250_expanded = radv_bc250_expand_primitive_attributes(bc250_mesh, bc250_empty_fs ? bc250_empty_fs : stages[MESA_SHADER_FRAGMENT].nir, compiler_info->key.bc250_compact_vertices &&
@@ -4304,7 +4305,7 @@ radv_graphics_pipeline_init(struct radv_graphics_pipeline *pipeline, struct radv
          const bool multiview_pipeline = gfx_state.vk.mv && gfx_state.vk.mv->view_mask;
          for (unsigned pass = 0; pass < (multiview_pipeline ? 2u : 1u); pass++) {
             if (!(result == VK_ERROR_FEATURE_NOT_PRESENT && (active_stages & VK_SHADER_STAGE_MESH_BIT_EXT) &&
-                  debug_get_bool_option("RADV_BC250_MESH_SPLIT_ANY", false) &&
+                  radv_dm_bool("RADV_BC250_MESH_SPLIT_ANY", false) &&
                   radv_device_physical(device)->bc250_native_mesh && pipeline->base.type == RADV_PIPELINE_GRAPHICS &&
                   !vk_find_struct_const(pCreateInfo->pNext, PIPELINE_LIBRARY_CREATE_INFO_KHR) &&
                   radv_bc250_fit_reset(device, pipeline, pCreateInfo, &gfx_state, active_stages, false, 0)))

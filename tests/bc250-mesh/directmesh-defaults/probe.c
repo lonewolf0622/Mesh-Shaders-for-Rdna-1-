@@ -27,16 +27,19 @@ int main(int argc, char **argv)
       vkEnumerateDeviceExtensionProperties(pd, NULL, &count, NULL);
       VkExtensionProperties *ext = calloc(count, sizeof(*ext));
       if (vkEnumerateDeviceExtensionProperties(pd, NULL, &count, ext)) return 6;
-      int gpl = 0, rt = 0;
+      int gpl = 0, rt = 0, vrs = 0;
       for (unsigned i = 0; i < count; i++) {
          gpl |= !strcmp(ext[i].extensionName, "VK_EXT_graphics_pipeline_library");
          rt |= !strcmp(ext[i].extensionName, "VK_KHR_ray_tracing_pipeline");
+         vrs |= !strcmp(ext[i].extensionName, "VK_KHR_fragment_shading_rate");
       }
-      printf("PROBE iteration=%u device=%04x mesh=%u task=%u gpl=%d rt=%d preset=%s store=%s hybrid=%s\n",
-             iteration, prop.deviceID, mesh.meshShader, mesh.taskShader, gpl, rt,
+      printf("PROBE iteration=%u device=%04x mesh=%u task=%u gpl=%d rt=%d vrs=%d preset=%s store=%s hybrid=%s\n",
+             iteration, prop.deviceID, mesh.meshShader, mesh.taskShader, gpl, rt, vrs,
              getenv("RADV_BC250_MESH_SAFE_FAST") ?: "unset",
              getenv("RADV_BC250_MESH_IDXPASS_STORE") ?: "unset",
              getenv("RADV_BC250_HYBRID_TASK") ?: "unset");
+      /* The driver must never write the environment (perftest included). */
+      printf("PROBE_ENV iteration=%u perftest=%s\n", iteration, getenv("RADV_PERFTEST") ?: "unset");
       free(ext);
       vkDestroyInstance(instance, NULL);
    }

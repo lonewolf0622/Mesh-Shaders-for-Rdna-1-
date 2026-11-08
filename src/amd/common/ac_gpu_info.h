@@ -323,6 +323,8 @@ struct radeon_info {
    uint32_t min_alloc_size;
    uint32_t address32_hi;
    bool has_dedicated_vram;
+   /* Set by RADV for BC-250 (RADV_BC250_DCC_32B): APU-reported GPU with GDDR6 (32B minimum request). */
+   bool bc250_dcc_32b;
    bool all_vram_visible;
    uint64_t high_va_offset;
    uint64_t high_va_max;

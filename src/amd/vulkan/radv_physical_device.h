@@ -125,6 +125,9 @@ struct radv_physical_device {
     * GFX10.1 has no VRS hardware: no VRS register or HTILE VRS field is ever written, shading
     * rate outputs are stripped and shading rate reads return 0 (radv_nir_bc250_vrs_noop). */
    bool bc250_vrs_noop;
+   /* Navi10/12 with an explicit RADV_DIRECTMESH=1: emulated ray tracing, so vkd3d-proton
+    * reports feature level 12_2 (it requires ray tracing tier 1.1 next to Mesh and VRS). */
+   bool bc250_emulate_rt;
    /* RADV_BC250_EXPOSE_FAST_BINDING (opt-in): VK_EXT_descriptor_buffer stays exposed
     * with hybrid Task, and the BC250 Mesh/Task pipeline paths accept descriptor
     * buffer pipelines (radv_bc250_prepare_task). */

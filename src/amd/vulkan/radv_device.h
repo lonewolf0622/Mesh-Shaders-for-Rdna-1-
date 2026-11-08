@@ -165,6 +165,14 @@ struct radv_bc250_device_env {
    bool no_split_l2_inv;      /* RADV_BC250_PERF_NO_SPLIT_L2_INV */
    bool split_batch_trace;    /* RADV_BC250_SPLIT_BATCH_TRACE */
    bool merge_prep_l2_inv;    /* RADV_BC250_MESH_MERGE_PREP_L2_INV */
+   /* Index-route switches read once here instead of on every draw. */
+   bool idx_trace;            /* BC250_IDX_TRACE */
+   bool idx_debug;            /* RADV_BC250_IDX_DEBUG */
+   bool idx_capture_batch;    /* BC250_IDX_CAPTURE_BATCH */
+   bool idx_setup_batch;      /* RADV_BC250_MESH_IDXPASS_SETUP_BATCH */
+   bool idx_batch;            /* RADV_BC250_MESH_IDXPASS_BATCH */
+   bool idx_batch_trim;       /* RADV_BC250_MESH_IDXPASS_BATCH_TRIM */
+   uint64_t idx_pool_bytes;   /* RADV_BC250_IDX_POOL_BYTES */
    bool native_task_direct;   /* BC250_NATIVE_TASK_DIRECT || RADV_BC250_NATIVE_TASK */
    bool native_task_indirect; /* BC250_NATIVE_TASK_INDIRECT || RADV_BC250_NATIVE_TASK */
    /* RADV_BC250_SCRATCH_REUSE=1: split indirect outputs and batch lists come

@@ -7,7 +7,8 @@ as its common source base (tree `61e7d6c29b3e50ebd07c1e18b8fd9e9b6f1507af`).
 The previous `74d1bc1` candidate did not include the v1.3.1 fixes and is superseded.
 
 This source build activates DirectMesh automatically on BC-250 (GFX1013) and
-RDNA 1 (Navi 10, Navi 12 and Navi 14). `RADV_DIRECTMESH=1` is no longer required.
+RDNA 1 (Navi 10 and Navi 12). Navi 14 is left out: upstream keeps NGG off on that
+chip because of hardware bugs, and its Mesh-only NGG path has not been run on hardware. `RADV_DIRECTMESH=1` is no longer required.
 `RADV_DIRECTMESH=0` disables DirectMesh. Existing individual environment options,
 including explicit zeroes, still override defaults. Selecting a staged ICD is
 still necessary when testing a driver that has not been installed.
@@ -15,15 +16,22 @@ still necessary when testing a driver that has not been installed.
 DRM PCI metadata selects the preset before cached driver options are read. The
 allowlist uses exact AMD display-device IDs from the Linux amdgpu PCI table;
 family checks also gate compiler and command-buffer paths. An unrelated GPU
-alone does not enable the preset. Defaults still use process environment settings,
-so on a mixed-GPU system their environment values are process-wide; the Mesh
-implementation remains gated per physical device.
+alone does not enable the preset. The preset is never written into the process
+environment: DirectMesh switches are read through `radv_dm_option()`
+(`radv_directmesh.c`), which returns the environment value when one is set and the
+preset value otherwise. Nothing leaks into child processes, nothing races with
+`getenv` on other threads, and the preset's NIR cache default applies to
+DirectMesh devices only. Index-route switches are read once per device, not per draw.
 
 The shared protected Mesh, split, merge, Task and indexed paths now accept RDNA 1.
-Navi 14 retains Mesa's legacy path for ordinary vertex/geometry graphics. Its Mesh
-stage alone uses NGG, preserving the existing zero late-allocation workaround.
-BC-250 memory, submission, CU/slice topology, VRS emulation and ray instruction
-exceptions remain limited to BC-250. RDNA 1 does not gain ray tracing capabilities.
+BC-250 memory, submission, CU/slice topology and ray instruction exceptions remain
+limited to BC-250. The 1x1-only VRS exposure applies to every DirectMesh device, so
+vkd3d-proton sees VRS tier 2 on RDNA 1 as on BC-250. vkd3d-proton reports feature
+level 12_2 only with ray tracing as well: with an explicit `RADV_DIRECTMESH=1`,
+Navi 10/12 also expose RADV's emulated ray tracing. The automatic default does not,
+because games that see ray tracing may enable it and emulation is slow; use
+`RADV_DIRECTMESH=1` or vkd3d-proton's `VKD3D_FEATURE_LEVEL=12_2` for games that
+require 12_2.
 The BC-250 per-primitive interpolation register exception is also retained only
 for BC-250; the RDNA 1 fixtures use the protected per-vertex representations.
 
@@ -61,6 +69,12 @@ The installed driver and existing frozen owner benchmark kits are unchanged.
 The query recording test omits `dumpibs`: the existing optional GFX10 packet
 pretty-printer asserts on a query counter enumeration. Vulkan validation and
 route-usage checks still cover that recording.
+
+The fork-safety update (no environment writes, per-device switches, Navi 14
+excluded, RDNA 1 VRS/ray tracing exposure) passed 113 unit tests, 96 activation and
+recording checks (on BC-250, 19 automatic recordings byte-identical in shaders and
+command words to the released `975ec91` driver with its explicit preset) and 69
+extended recordings. CPU evidence: `/home/deck/mesh-test/directmesh-fork-safety-evidence/`.
 
 Reproduction is in `tests/bc250-mesh/directmesh-defaults/README.md`. CPU evidence:
 `/home/deck/mesh-test/directmesh-v131-rdna-evidence/`.

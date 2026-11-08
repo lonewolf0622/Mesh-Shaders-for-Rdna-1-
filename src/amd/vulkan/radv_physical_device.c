@@ -297,6 +297,8 @@ radv_emulate_rt(const struct radv_physical_device *pdev)
    const struct radv_instance *instance = radv_physical_device_instance(pdev);
    if (instance->experimental_flags & RADV_EXPERIMENTAL_EMULATE_RT)
       return true;
+   if (pdev->bc250_emulate_rt)
+      return true;
 
    /* Do not force emulated RT on GPUs that have native support. */
    return !pdev->info.compiler_info.has_image_bvh_intersect_ray && instance->drirc.features.emulate_rt;
@@ -1392,12 +1394,12 @@ radv_physical_device_get_features(const struct radv_physical_device *pdev, struc
        * Mesh shaders take the expanded route. vkd3d-proton turns D3D12 view instancing off when Mesh
        * is exposed without multiview Mesh. */
       .multiviewMeshShader = taskmesh_en ||
-         (pdev->bc250_native_mesh && debug_get_bool_option("RADV_BC250_EXPOSE_MULTIVIEW_MESH", false)),
+         (pdev->bc250_native_mesh && radv_dm_bool("RADV_BC250_EXPOSE_MULTIVIEW_MESH", false)),
       .primitiveFragmentShadingRateMeshShader = taskmesh_en,
       /* BC250 counts MESH/TASK invocations through GDS snapshots (v8). */
       /* Replay splitting does not yet preserve mesh-invocation queries. */
       .meshShaderQueries = pdev->bc250_native_mesh && !pdev->bc250_native_task &&
-         !debug_get_bool_option("RADV_BC250_SPLIT_MESH", false),
+         !radv_dm_bool("RADV_BC250_SPLIT_MESH", false),
 
       /* VK_EXT_depth_clip_control */
       .depthClipControl = true,
@@ -2646,6 +2648,8 @@ radv_physical_device_try_create(struct radv_instance *instance, drmDevicePtr drm
    }
 
    memcpy(&pdev->info, &winsys_info.base, sizeof(pdev->info));
+   /* RADV_BC250_DCC_32B: the BC-250 reports as an APU but its memory is GDDR6 (32B minimum request). */
+   pdev->info.bc250_dcc_32b = pdev->info.family == CHIP_GFX1013 && radv_dm_bool("RADV_BC250_DCC_32B", false);
    memcpy(&pdev->syncobj_sync_type, &winsys_info.syncobj_sync_type, sizeof(pdev->syncobj_sync_type));
 
    for (uint32_t p = RADEON_CTX_PRIORITY_LOW; p <= RADEON_CTX_PRIORITY_REALTIME; p++) {
@@ -2779,7 +2783,7 @@ radv_physical_device_try_create(struct radv_instance *instance, drmDevicePtr drm
    pdev->bc250_native_task = pdev->bc250_native_mesh &&
       radv_compute_queue_enabled(pdev) &&
       (debug_get_bool_option("BC250_NATIVE_TASK_COMPILE", false) ||
-       debug_get_bool_option("RADV_BC250_NATIVE_TASK", false));
+       radv_dm_bool("RADV_BC250_NATIVE_TASK", false));
    /* DirectMesh defaults: DXVK (D3D9-11, no Mesh shaders) keeps GPL, shader objects and pipeline binaries
     * instead of the preset's hybrid Task. An explicit RADV_BC250_HYBRID_TASK still applies. */
    const bool bc250_dxvk = instance->vk.app_info.engine_name && !strcmp(instance->vk.app_info.engine_name, "DXVK");
@@ -2789,9 +2793,9 @@ radv_physical_device_try_create(struct radv_instance *instance, drmDevicePtr drm
    if (pdev->bc250_native_mesh && bc250_dxvk && radv_bc250_directmesh_hybrid && getenv("BC250_TRACE_COMPILE"))
       fprintf(stderr, "radv/bc250: DXVK: hybrid Task off, GPL/shader objects/pipeline binaries kept\n");
    pdev->bc250_expose_dgc = pdev->bc250_native_mesh && !pdev->bc250_native_task &&
-      debug_get_bool_option("RADV_BC250_EXPOSE_DGC", false);
+      radv_dm_bool("RADV_BC250_EXPOSE_DGC", false);
    pdev->bc250_fast_binding = pdev->bc250_native_mesh &&
-      debug_get_bool_option("RADV_BC250_EXPOSE_FAST_BINDING", false);
+      radv_dm_bool("RADV_BC250_EXPOSE_FAST_BINDING", false);
    /* GFX10.1 has no ROTATE_PC_PTR or LOAD_PROVOKING_VTX; the fragment shader
     * recovers the API vertex order from a position reference exported by the
     * last pre-rasterization stage (radv_nir_bc250_lower_bary_rotation). On by
@@ -2801,8 +2805,10 @@ radv_physical_device_try_create(struct radv_instance *instance, drmDevicePtr drm
    /* No VRS hardware on GFX10.1 (the VRS registers and HTILE fields are GFX10.3+), but vkd3d-proton
     * reports DirectX 12 Ultimate (feature level 12_2) only with VRS tier 2: the extension is exposed
     * and shading is always 1x1 (radv_nir_bc250_vrs_noop). On by default; RADV_BC250_VRS_NOOP=0 hides it. */
-   pdev->bc250_vrs_noop = pdev->info.family == CHIP_GFX1013 &&
+   pdev->bc250_vrs_noop = (pdev->info.family == CHIP_GFX1013 || pdev->bc250_native_mesh) &&
       debug_get_bool_option("RADV_BC250_VRS_NOOP", true);
+   pdev->bc250_emulate_rt = pdev->bc250_native_mesh && pdev->info.family != CHIP_GFX1013 &&
+      !pdev->info.compiler_info.has_image_bvh_intersect_ray && radv_directmesh_explicit(getenv("RADV_DIRECTMESH"));
    if (pdev->bc250_native_mesh) {
       assert(radv_directmesh_family(pdev->info.family));
       assert(pdev->info.gfx_level == GFX10);

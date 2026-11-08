@@ -58,7 +58,8 @@ for frag in ('bary', 'pervertex'):
     configs.append((frag, 'barymesh', frag, None, dict(RADV_BC250_MESH_IDXPASS='0')))
 configs.append(('primid', 'primidmesh', 'primidfrag', None, dict(RADV_BC250_MESH_IDXPASS='0')))
 rows = []
-for gpu in ('gfx1013', 'navi10', 'navi12', 'navi14'):
+# Navi 14 is outside DirectMesh (check.py asserts Mesh stays hidden there).
+for gpu in ('gfx1013', 'navi10', 'navi12'):
     for label, mesh, frag, task, extra in configs:
         tag = gpu + '-' + label
         env = dict(PATH='/usr/bin', HOME='/tmp', LD_PRELOAD=str(out/'noop/libamdgpu_noop_drm_shim.so'),
@@ -91,10 +92,6 @@ for gpu in ('gfx1013', 'navi10', 'navi12', 'navi14'):
             assert any(k == 'pool' and d == 'GTT' and c == '1' for k,d,c,w,n in allocations), tag
         if label in ('query','multiview'):
             assert 'idx_direct=0 ' in log, tag
-        if gpu == 'navi14' and label not in ('reference', 'query'):
-            late = re.findall(r'SPI_SHADER_LATE_ALLOC_GS = (\d+)',log)
-            assert set(late) <= {'0'}, 'Navi14 late allocation: '+tag
-            assert late or re.search(r'idx_direct=[1-9]', log), 'missing Navi14 stage evidence: '+tag
         rows.append(dict(case=tag,validation_errors=0))
         print('PASS',tag,flush=True)
 (out/'extended-summary.json').write_text(json.dumps(dict(status='PASS',launches=len(rows),GPU_runs=0,cases=rows),indent=2)+'\n')
