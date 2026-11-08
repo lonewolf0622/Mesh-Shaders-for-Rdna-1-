@@ -83,9 +83,14 @@ radv_bc250_device_env_init(struct radv_device *device, const struct radv_physica
    /* RADV_BC250_MESH_TASK_IDX (default off): Task + Mesh pipelines without a protected Mesh route run the
     * hybrid producer and the stored index route instead of failing. TASK_IDX_PASSES index passes per
     * producer chunk (0, the default: 16, the maximum); records beyond them are not drawn. */
+   /* =force (testing): every Task + Mesh pipeline the route admits uses it, so the same shader can be compared
+    * against its Mesh route. */
+   const char *task_idx = radv_dm_option("RADV_BC250_MESH_TASK_IDX");
+   const bool task_idx_force = task_idx && !strcmp(task_idx, "force");
    env->task_idx = pdev->bc250_hybrid_task && !pdev->bc250_native_task &&
-                   radv_dm_bool("RADV_BC250_MESH_TASK_IDX", false);
+                   (task_idx_force || radv_dm_bool("RADV_BC250_MESH_TASK_IDX", false));
    env->task_idx_passes = CLAMP(radv_dm_num("RADV_BC250_MESH_TASK_IDX_PASSES", 0), 0, 16);
+   env->task_idx_force = env->task_idx && task_idx_force;
    env->idx_trace = getenv("BC250_IDX_TRACE") != NULL;
    env->idx_debug = getenv("RADV_BC250_IDX_DEBUG") != NULL;
    env->idx_capture_batch = getenv("BC250_IDX_CAPTURE_BATCH") != NULL;

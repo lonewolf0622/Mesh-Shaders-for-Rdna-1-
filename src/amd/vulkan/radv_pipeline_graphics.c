@@ -4388,6 +4388,16 @@ radv_graphics_pipeline_create(VkDevice _device, VkPipelineCache _cache, const Vk
    pipeline->base.create_flags = vk_graphics_pipeline_create_flags(pCreateInfo);
    pipeline->base.is_internal = _cache == device->meta_state.cache;
 
+   if (device->bc250_env.task_idx_force && _cache != device->meta_state.cache) {
+      for (uint32_t i = 0; i < pCreateInfo->stageCount; i++) {
+         if (pCreateInfo->pStages[i].stage == VK_SHADER_STAGE_TASK_BIT_EXT &&
+             radv_bc250_task_idx_pipeline_create(device, pCreateInfo, pAllocator, pPipeline) == VK_SUCCESS) {
+            radv_pipeline_destroy(device, &pipeline->base, pAllocator);
+            return VK_SUCCESS;
+         }
+      }
+   }
+
    result = radv_graphics_pipeline_init(pipeline, device, cache, pCreateInfo);
    if (result != VK_SUCCESS) {
       radv_pipeline_destroy(device, &pipeline->base, pAllocator);
