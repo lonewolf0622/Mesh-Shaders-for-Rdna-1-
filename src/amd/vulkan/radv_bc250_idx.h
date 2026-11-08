@@ -46,6 +46,7 @@ struct bc250_idx_setup_args {
    (RADV_BC250_IDX_SETUP_BATCH_HEADER_BYTES + RADV_BC250_IDX_SETUP_BATCH_CALLS * sizeof(struct bc250_idx_setup_args))
 
 nir_shader *radv_bc250_idx_build_setup(const nir_shader_compiler_options *options, bool stored);
+nir_shader *radv_bc250_idx_build_setup_task(const nir_shader_compiler_options *options);
 nir_shader *radv_bc250_idx_build_setup_batch(const nir_shader_compiler_options *options);
 
 unsigned radv_bc250_idx_output_layout(nir_shader *mesh);

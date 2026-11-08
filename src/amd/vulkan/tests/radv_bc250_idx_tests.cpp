@@ -462,7 +462,7 @@ idx_task_chain_check(const nir_shader_compiler_options *options, unsigned actual
                      unsigned max_passes)
 {
    const unsigned nmax = 65, P = 64, V = 64 * 65, output_bytes = 1792;
-   nir_shader *setup = radv_bc250_idx_build_setup(options, true);
+   nir_shader *setup = radv_bc250_idx_build_setup_task(options);
    nir_opt_dce(setup);
    nir_remove_dead_derefs(setup);
    constexpr uint64_t records_va = 0x100000, count_va = 0x200000, pool_va = 0x700000;
@@ -500,6 +500,8 @@ idx_task_chain_check(const nir_shader_compiler_options *options, unsigned actual
                      {draws_va[t], draws[t].size() * 4, (uint8_t *)draws[t].data()},
                      {mesh_va[t], mesh[t].size() * 4, (uint8_t *)mesh[t].data()},
                      {pool_va, pool.size() * 4, (uint8_t *)pool.data()}});
+      /* The next pass's COND_EXEC predicate: 0/1, set exactly when records overflowed. */
+      EXPECT_EQ(table[t][6], table[t][5] ? 1u : 0u);
       uint64_t used = 0;
       /* The indexed draw reads table[0] entries; later entries keep stale contents. */
       for (unsigned i = 0; i < table[t][0]; i++) {

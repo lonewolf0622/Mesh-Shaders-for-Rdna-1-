@@ -490,7 +490,7 @@ bc250_idx_arg(nir_builder *b, nir_def *entry, unsigned offset, unsigned bits)
  * fits exactly when its inclusive end is within the capacity; every record from the first that does not fit goes
  * to the Mesh fallback. */
 static nir_def *
-bc250_idx_setup_body(nir_builder *b, bool stored, nir_def *entry, nir_def *prior_base)
+bc250_idx_setup_body(nir_builder *b, bool stored, nir_def *entry, nir_def *prior_base, bool task_flag)
 {
    nir_def *records = bc250_idx_arg(b, entry, 0, 64), *count = bc250_idx_arg(b, entry, 8, 64);
    nir_def *table = bc250_idx_arg(b, entry, 16, 64), *dims = bc250_idx_arg(b, entry, 24, 64);
@@ -602,6 +602,11 @@ bc250_idx_setup_body(nir_builder *b, bool stored, nir_def *entry, nir_def *prior
       nir_def *fallback = nir_bcsel(b, nir_ine_imm(b, nir_load_var(b, fb_var), 0), n, zero);
       nir_store_global(b, nir_vec4(b, n, gt, dx, dy), table, .align_mul = 4);
       nir_store_global(b, nir_vec2(b, nir_imm_int(b, 1), fallback), nir_iadd_imm(b, table, 16), .align_mul = 4);
+      /* Task index route: a 0/1 "overflow left" flag for the next pass's COND_EXEC (BC-250 COND_EXEC is only
+       * proven with Boolean predicates). */
+      if (task_flag)
+         nir_store_global(b, nir_b2i32(b, nir_ine_imm(b, nir_load_var(b, fb_var), 0)), nir_iadd_imm(b, table, 24),
+                          .align_mul = 4);
       /* Pool use: the fitting records' end (the carry saturates past the capacity only on overflow). */
       if (!entry)
          nir_store_global(b, nir_umin(b, nir_load_var(b, carry_var), capacity), pool, .align_mul = 4);
@@ -625,7 +630,18 @@ nir_shader *
 radv_bc250_idx_build_setup(const nir_shader_compiler_options *options, bool stored)
 {
    nir_builder b = bc250_idx_setup_builder(options, "bc250_idx_setup");
-   bc250_idx_setup_body(&b, stored, NULL, NULL);
+   bc250_idx_setup_body(&b, stored, NULL, NULL, false);
+   NIR_PASS(_, b.shader, nir_lower_vars_to_ssa);
+   nir_validate_shader(b.shader, "BC250 index setup");
+   return b.shader;
+}
+
+/* Task index route: stored, and also writes the overflow flag at table + 24. */
+nir_shader *
+radv_bc250_idx_build_setup_task(const nir_shader_compiler_options *options)
+{
+   nir_builder b = bc250_idx_setup_builder(options, "bc250_idx_setup");
+   bc250_idx_setup_body(&b, true, NULL, NULL, true);
    NIR_PASS(_, b.shader, nir_lower_vars_to_ssa);
    nir_validate_shader(b.shader, "BC250 index setup");
    return b.shader;
@@ -657,7 +673,7 @@ radv_bc250_idx_build_setup_batch(const nir_shader_compiler_options *options)
       nir_store_var(&b, base, nir_read_first_invocation(&b, nir_load_global(&b, 1, 32, pool, .align_mul = 4)), 1);
       nir_pop_if(&b, NULL);
       /* output_bytes=0 also handles replay IDX entries in a mixed batch. */
-      nir_def *used = bc250_idx_setup_body(&b, true, entry, nir_load_var(&b, base));
+      nir_def *used = bc250_idx_setup_body(&b, true, entry, nir_load_var(&b, base), false);
       nir_store_var(&b, base, used, 1);
       nir_push_if(&b, nir_iand(&b, nir_ieq_imm(&b, nir_load_subgroup_invocation(&b), 0),
                              nir_ieq(&b, nir_iadd_imm(&b, i, 1), n)));

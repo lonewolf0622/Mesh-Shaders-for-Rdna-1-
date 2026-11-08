@@ -19,9 +19,11 @@ With `RADV_BC250_MESH_TASK_IDX=1`, such a pipeline is created as the Task index 
 - **Overflow:** there is no Mesh route to fall back to. Each producer chunk runs up to N index passes, and
   pass p draws pass p-1's overflow suffix. The setup shader already writes that suffix as ordinary records
   plus a GPU count. Every pass drains earlier readers and restarts the pool, and two table sets per
-  command buffer alternate between passes. N defaults to enough passes for one Mesh workgroup per Task
-  workgroup of a full chunk, plus one, at most 16 (`RADV_BC250_MESH_TASK_IDX_PASSES` overrides it).
-  Records left after N passes are not drawn.
+  command buffer alternate between passes. Pass p > 0 sits in nested `COND_EXEC` regions on a 0/1 flag
+  written by pass p-1's setup (a Task-only setup variant). When nothing overflowed, the later passes,
+  including their drains, are skipped on the GPU (about 170 dwords each in the command buffer). A skipped
+  pass skips every later one, so no pass reads a stale flag. N defaults to 16
+  (`RADV_BC250_MESH_TASK_IDX_PASSES` overrides it). Records left after N passes are not drawn.
 
 Limits:
 
