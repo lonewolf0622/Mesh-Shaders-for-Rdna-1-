@@ -14,10 +14,11 @@ sed "s|\"library_path\": *\"[^\"]*\"|\"library_path\": \"$kit/driver/libvulkan_r
    "$build/src/amd/vulkan/radeon_devenv_icd.x86_64.json" > "$kit/driver/icd.json"
 grep -q "$kit/driver/libvulkan_radeon.so" "$kit/driver/icd.json"
 fx="$src/tests/bc250-mesh/split-admission"
-for m in dedup_task128 early_scratch_task128 dedup_task128_wide_np; do
+for m in dedup_task128 early_scratch_task128 dedup_task128_wide_np compact_task128 feat_cull_task feat_2d_task \
+         feat_numwg_task feat_primid_task feat_bary_task feat_layer_task feat_view_task; do
    glslangValidator -S mesh --target-env vulkan1.3 -o "$kit/shaders/$m.mesh.spv" "$fx/$m.mesh" >/dev/null
 done
-for f in f early_scratch_task128 dedup_task128_wide_np; do
+for f in f early_scratch_task128 dedup_task128_wide_np feat_primid_task feat_bary_task; do
    glslangValidator -S frag --target-env vulkan1.3 -o "$kit/shaders/$f.frag.spv" "$fx/$f.frag" >/dev/null
 done
 glslangValidator -S task --target-env vulkan1.3 -o "$kit/shaders/t.task.spv" "$fx/t.task" >/dev/null
@@ -32,7 +33,7 @@ Driver: source $commit, frozen copy in driver/ (the installed driver is not touc
 Run once, on a quiet system (close games, Steam, builds):
     python3 $kit/run.py
 
-8 steps, lowest risk first, one GPU submission each; stops at the first failure. Steps 3, 4 and 6 render a
+24 steps, lowest risk first, one GPU submission each; stops at the first failure. Steps 3, 4, 6 and every even step from 10 to 22 render a
 shader through the Task index route and must match the same shader on the Mesh route pixel for pixel.
 If the machine freezes: reboot and send state/ (the last .log is the step that was running). Do not rerun:
 the kit refuses to repeat a step that started and never finished.

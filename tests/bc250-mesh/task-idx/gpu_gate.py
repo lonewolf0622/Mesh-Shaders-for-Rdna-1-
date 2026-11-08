@@ -30,6 +30,23 @@ STEPS = [
      {'RADV_BC250_MESH_TASK_IDX': '1'}, 'BC250 TASK IDX: applied', None),
     ('8-wide-task-idx-indirect', 'dedup_task128_wide_np.mesh.spv', 'dedup_task128_wide_np.frag.spv', 'count',
      {'RADV_BC250_MESH_TASK_IDX': '1'}, 'BC250 TASK IDX: applied', None),
+    # Task index route features against the same shader on the Mesh route ('!' = must not appear)
+    ('9-cull-mesh-route', 'feat_cull_task.mesh.spv', 'f.frag.spv', None, {}, '!BC250 TASK IDX: applied', None),
+    ('10-cull-task-idx', 'feat_cull_task.mesh.spv', 'f.frag.spv', None, {'RADV_BC250_MESH_TASK_IDX': 'force'}, 'BC250 TASK IDX: applied', '9-cull-mesh-route'),
+    ('11-2d-mesh-route', 'feat_2d_task.mesh.spv', 'f.frag.spv', None, {}, '!BC250 TASK IDX: applied', None),
+    ('12-2d-task-idx', 'feat_2d_task.mesh.spv', 'f.frag.spv', None, {'RADV_BC250_MESH_TASK_IDX': 'force'}, 'BC250 TASK IDX: applied', '11-2d-mesh-route'),
+    ('13-numwg-mesh-route', 'feat_numwg_task.mesh.spv', 'f.frag.spv', None, {}, '!BC250 TASK IDX: applied', None),
+    ('14-numwg-task-idx', 'feat_numwg_task.mesh.spv', 'f.frag.spv', None, {'RADV_BC250_MESH_TASK_IDX': 'force'}, 'BC250 TASK IDX: applied', '13-numwg-mesh-route'),
+    ('15-primid-mesh-route', 'feat_primid_task.mesh.spv', 'feat_primid_task.frag.spv', None, {}, '!BC250 TASK IDX: applied', None),
+    ('16-primid-task-idx', 'feat_primid_task.mesh.spv', 'feat_primid_task.frag.spv', None, {'RADV_BC250_MESH_TASK_IDX': 'force'}, 'BC250 TASK IDX: applied', '15-primid-mesh-route'),
+    ('17-bary-mesh-route', 'feat_bary_task.mesh.spv', 'feat_bary_task.frag.spv', None, {}, '!BC250 TASK IDX: applied', None),
+    ('18-bary-task-idx', 'feat_bary_task.mesh.spv', 'feat_bary_task.frag.spv', None, {'RADV_BC250_MESH_TASK_IDX': 'force'}, 'BC250 TASK IDX: applied', '17-bary-mesh-route'),
+    ('19-layer-mesh-route', 'feat_layer_task.mesh.spv', 'f.frag.spv', None, {}, '!BC250 TASK IDX: applied', None),
+    ('20-layer-task-idx', 'feat_layer_task.mesh.spv', 'f.frag.spv', None, {'RADV_BC250_MESH_TASK_IDX': 'force'}, 'BC250 TASK IDX: applied', '19-layer-mesh-route'),
+    ('21-multiview-mesh-route', 'feat_view_task.mesh.spv', 'f.frag.spv', None, {'INDEX_MULTIVIEW': '1'}, '!BC250 TASK IDX: applied', None),
+    ('22-multiview-task-idx', 'feat_view_task.mesh.spv', 'f.frag.spv', None, {'INDEX_MULTIVIEW': '1', 'RADV_BC250_MESH_TASK_IDX': 'force'}, 'BC250 TASK IDX: applied', '21-multiview-mesh-route'),
+    ('23-compact-task-idx-direct', 'compact_task128.mesh.spv', 'f.frag.spv', None, {'RADV_BC250_MESH_TASK_IDX': '1'}, 'BC250 TASK IDX: applied', None),
+    ('24-compact-task-idx-indirect', 'compact_task128.mesh.spv', 'f.frag.spv', 'count', {'RADV_BC250_MESH_TASK_IDX': '1'}, 'BC250 TASK IDX: applied', None),
 ]
 
 
@@ -80,9 +97,10 @@ def run_step(name, mesh, frag, indirect, extra, marker):
                 text.append(line)
             ready = line.startswith('INDEX_READY')
     joined = ''.join(text)
-    if not ready or marker not in joined:
+    route_ok = (marker[1:] not in joined) if marker.startswith('!') else (marker in joined)
+    if not ready or not route_ok:
         proc.kill()
-        log.write(f'GATE: not released (ready={ready}, route marker present={marker in joined})\n')
+        log.write(f'GATE: not released (ready={ready}, route as intended={route_ok})\n')
         log.close()
         return False, 'not released: ' + ('route not compiled as intended' if ready else 'compile/validation refused')
     # Evidence first: the log and the "started" marker reach the disk before the GPU sees anything.
