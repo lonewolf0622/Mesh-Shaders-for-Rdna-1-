@@ -36,9 +36,9 @@ esac
 
 [ "$(uname -m)" = x86_64 ] || die "DirectMesh needs an x86_64 system."
 [ "$(id -u)" != 0 ] || die "Run this as your normal user, not as root (it asks for sudo only to install build packages)."
-if lspci 2>/dev/null | grep -qiE 'VGA|Display|3D'; then
-   lspci 2>/dev/null | grep -iE 'VGA|Display|3D' | grep -qiE 'AMD|ATI' ||
-      echo "Note: no AMD GPU found. DirectMesh only does something on an AMD BC-250 or RDNA 1 (Navi 10/12) GPU."
+GPUS=$(lspci 2>/dev/null | grep -iE 'VGA|Display|3D' || true)
+if [ -n "$GPUS" ] && ! printf '%s\n' "$GPUS" | grep -iE 'AMD|ATI' >/dev/null; then
+   echo "Note: no AMD GPU found. DirectMesh only does something on an AMD BC-250 or RDNA 1 (Navi 10/12) GPU."
 fi
 if grep -qsE '^ID=(steamos|bazzite|aurora|bluefin)' /etc/os-release || [ -e /run/ostree-booted ]; then
    die "This looks like an immutable system (SteamOS, Bazzite, Silverblue...). This script installs build packages
@@ -50,22 +50,22 @@ fi
 # (read in a subshell: os-release defines VERSION and other names this script uses)
 OS_ID=$( (. /etc/os-release 2>/dev/null; echo "${ID:-}") )
 ids=" $( (. /etc/os-release 2>/dev/null; echo "${ID:-} ${ID_LIKE:-}") ) "
-PKG_ARCH="base-devel python curl tar xz glslang libx11 libxcb libxshmfence xcb-util-keysyms wayland wayland-protocols
+PKG_ARCH="base-devel cmake python curl tar xz glslang libx11 libxcb libxshmfence xcb-util-keysyms wayland wayland-protocols
           systemd-libs expat zlib zstd libelf"
-PKG_DEB="build-essential pkg-config python3 python3-venv python3-pip curl tar xz-utils glslang-tools libx11-dev
+PKG_DEB="build-essential cmake pkg-config python3 python3-venv python3-pip curl tar xz-utils glslang-tools libx11-dev
          libx11-xcb-dev libxcb1-dev libxcb-dri3-dev libxcb-present-dev libxcb-xfixes0-dev libxcb-sync-dev
          libxcb-randr0-dev libxcb-shm0-dev libxcb-keysyms1-dev libxshmfence-dev libwayland-dev wayland-protocols
          libudev-dev libexpat1-dev zlib1g-dev libzstd-dev libelf-dev"
-PKG_FED="gcc gcc-c++ pkgconf-pkg-config python3 python3-pip curl tar xz glslang libX11-devel libxcb-devel
+PKG_FED="gcc gcc-c++ cmake pkgconf-pkg-config python3 python3-pip curl tar xz glslang libX11-devel libxcb-devel
          libxshmfence-devel xcb-util-keysyms-devel wayland-devel wayland-protocols-devel systemd-devel expat-devel
          zlib-devel libzstd-devel elfutils-libelf-devel"
-PKG_SUSE="gcc gcc-c++ pkgconf python3 python3-pip curl tar xz glslang-devel libX11-devel libxcb-devel
+PKG_SUSE="gcc gcc-c++ cmake pkgconf python3 python3-pip curl tar xz glslang-devel libX11-devel libxcb-devel
           libxshmfence-devel xcb-util-keysyms-devel wayland-devel wayland-protocols-devel libudev-devel libexpat-devel
           zlib-devel libzstd-devel libelf-devel"
 
 missing() {
    local m=""
-   for c in cc c++ pkg-config python3 curl tar glslangValidator wayland-scanner; do
+   for c in cc c++ cmake pkg-config python3 curl tar glslangValidator wayland-scanner; do
       command -v "$c" >/dev/null 2>&1 || m="$m $c"
    done
    python3 -c 'import venv, ensurepip' 2>/dev/null || m="$m python3-venv"
@@ -106,6 +106,33 @@ if [ ! -x "$WORK/venv/bin/meson" ]; then
    "$WORK/venv/bin/pip" install --quiet 'meson>=1.4,<2' ninja mako pyyaml packaging
 fi
 export PATH="$WORK/venv/bin:$PATH"
+
+# --- glslang 12.2 or newer (Mesa's requirement; Debian 12 and Ubuntu 22.04 ship older ones) -----------------------
+glslang_version() { glslangValidator --version 2>/dev/null | head -n 1 | awk -F: '{gsub(/ /, "", $3); print $3}'; }
+glslang_new_enough() {
+   local v; v=$(glslang_version)
+   [ -n "$v" ] && [ "$(printf '%s\n12.2\n' "$v" | sort -V | head -n 1)" = 12.2 ]
+}
+if [ -x "$WORK/tools/bin/glslangValidator" ]; then
+   export PATH="$WORK/tools/bin:$PATH"
+fi
+glslang_found=$(glslang_version)
+if [ -n "${DIRECTMESH_BUILD_GLSLANG:-}" ] || ! glslang_new_enough; then
+   say "Building glslang 14.3.0 (Mesa needs 12.2 or newer; found: ${glslang_found:-none})"
+   rm -rf "$WORK/glslang" "$WORK/tools"
+   mkdir -p "$WORK/glslang"
+   curl -fL --retry 3 --progress-bar "https://github.com/KhronosGroup/glslang/archive/refs/tags/14.3.0.tar.gz" |
+      tar -xz -C "$WORK/glslang" --strip-components=1
+   cmake -S "$WORK/glslang" -B "$WORK/glslang/build" -DCMAKE_BUILD_TYPE=Release -DCMAKE_INSTALL_PREFIX="$WORK/tools" \
+      -DENABLE_OPT=OFF -DGLSLANG_TESTS=OFF -DBUILD_SHARED_LIBS=OFF -DCMAKE_CXX_FLAGS="-include cstdint" \
+      > "$WORK/glslang.log" 2>&1 &&
+   cmake --build "$WORK/glslang/build" -j "$JOBS" >> "$WORK/glslang.log" 2>&1 &&
+   cmake --install "$WORK/glslang/build" >> "$WORK/glslang.log" 2>&1 ||
+      { tail -n 30 "$WORK/glslang.log"; die "Building glslang failed (full log: $WORK/glslang.log)."; }
+   rm -rf "$WORK/glslang"
+   export PATH="$WORK/tools/bin:$PATH"
+   glslang_new_enough || die "glslang $(glslang_version) is still older than 12.2."
+fi
 
 # --- source -------------------------------------------------------------------------------------------------------
 SRC="$WORK/src-$VERSION"
@@ -162,7 +189,8 @@ rm -rf "$WORK/build"
 say "DirectMesh $VERSION is installed in $PREFIX"
 if command -v vulkaninfo >/dev/null 2>&1; then
    VK_DRIVER_FILES="$FILES" vulkaninfo --summary 2>/dev/null | grep -E 'deviceName|driverInfo' | sed 's/^\s*/   /' || true
-   if VK_DRIVER_FILES="$FILES" vulkaninfo 2>/dev/null | grep -qE 'meshShader *= *true'; then
+   # (grep reads everything: with pipefail, an early grep -q exit would fail vulkaninfo on a closed pipe)
+   if VK_DRIVER_FILES="$FILES" vulkaninfo 2>/dev/null | grep -E 'meshShader *= *true' >/dev/null; then
       echo "   Mesh shaders: yes"
    else
       echo "   Mesh shaders: no (this GPU is not a BC-250 or Navi 10/12, or DirectMesh is turned off)"

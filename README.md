@@ -24,8 +24,10 @@ That's it. The script:
 - installs it for your user in `~/.local/share/directmesh`, without touching the system driver;
 - prints the exact line to paste into Steam.
 
-Works on Arch, CachyOS, Manjaro, EndeavourOS, Debian, Ubuntu, Linux Mint, Pop!_OS, Fedora, Nobara and openSUSE. On
-other distributions it tells you which development packages to install. Not supported by the script: immutable
+It knows the build packages for Arch, CachyOS, Manjaro, EndeavourOS, Debian, Ubuntu, Linux Mint, Pop!_OS, Fedora,
+Nobara and openSUSE (so far tested on CachyOS; reports from other distributions are welcome). Where the system's
+glslang is too old for Mesa (Debian 12, Ubuntu 22.04), it builds a newer one for itself. On other distributions it
+tells you which development packages to install. Not supported by the script: immutable
 systems (SteamOS, Bazzite, Fedora Silverblue), where it cannot install build packages, and Flatpak Steam, which cannot
 see the driver folder.
 
