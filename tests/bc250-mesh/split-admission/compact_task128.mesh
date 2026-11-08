@@ -1,0 +1,22 @@
+#version 460
+#extension GL_EXT_mesh_shader : require
+// Primitive compaction through a shared counter, two pieces: the slot each
+// primitive lands in depends on the atomics' order. Must stay refused.
+layout(local_size_x=128) in;
+layout(triangles, max_vertices=160, max_primitives=128) out;
+layout(location=0) perprimitiveEXT flat out vec4 pcol[];
+struct P { uint base; }; taskPayloadSharedEXT P pl;
+shared uint count;
+
+void main(){
+ uint i=gl_LocalInvocationIndex;
+ if(i==0u) count=0u;
+ barrier();
+ SetMeshOutputsEXT(160,128);
+ for(uint v=i; v<160u; v+=128u) gl_MeshVerticesEXT[v].gl_Position=vec4(float(v%16u)/8.0-1.0,float(v/16u)/10.0-1.0,0.5,1);
+ for(uint p=i; p<128u; p+=128u) {
+   uint slot=min(atomicAdd(count,1u),127u);
+   gl_PrimitiveTriangleIndicesEXT[slot]=uvec3(p%160u,(p+1u)%160u,(p+2u)%160u);
+   pcol[slot]=vec4(float(p)/255.0,0,1,1);
+ }
+}

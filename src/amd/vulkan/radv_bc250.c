@@ -3143,9 +3143,14 @@ radv_bc250_split_mesh(nir_shader *mesh, nir_shader *task, nir_shader *fs, bool d
     * Every piece re-executes the same deterministic body in its own
     * workgroup, so each piece leaves the same values in its own shared
     * memory: non-atomic shared loads and stores and shared barriers are
-    * replica-safe. Shared atomics are not (a used result depends on the
-    * hardware serialization, which differs between the pieces), nor are
-    * atomic shared loads/stores, which observe an order between waves.
+    * replica-safe. Shared atomics and atomic shared loads/stores are not in
+    * general: their results depend on the hardware serialization, which may
+    * differ between the pieces. They are admitted when there is one piece (the
+    * body runs exactly once, as without the split), or when
+    * radv_bc250_split_shared_atomic_hazard proves that every piece slices the
+    * same primitives (count, slots and per-primitive values independent of the
+    * atomics' completion order; vertex indices and vertex outputs may depend on
+    * it, since each piece exports all of its own vertices).
     * NumWorkGroups is rewritten to the application grid below.
     *
     * An external (buffer, global or image) atomic whose result is unused is
@@ -3163,7 +3168,7 @@ radv_bc250_split_mesh(nir_shader *mesh, nir_shader *task, nir_shader *fs, bool d
     * read-only bindings.
     */
    const bool split_stores = radv_dm_bool("RADV_BC250_MESH_SPLIT_STORES", false);
-   bool external_atomics = false, external_stores = false;
+   bool external_atomics = false, external_stores = false, shared_atomics = false;
    const bool reads_external = contract.memory_effects & RADV_BC250_EXTERNAL_READ;
    const bool reads_storage = contract.memory_effects & RADV_BC250_STORAGE_READ;
    nir_foreach_function_impl(impl, mesh) {
@@ -3189,6 +3194,10 @@ radv_bc250_split_mesh(nir_shader *mesh, nir_shader *task, nir_shader *fs, bool d
                external_atomics = true;
                continue;
             }
+            if (in->intrinsic == nir_intrinsic_shared_atomic || in->intrinsic == nir_intrinsic_shared_atomic_swap) {
+               shared_atomics = true;
+               continue;
+            }
             if (strstr(name, "atomic") || strstr(name, "clock") ||
                 strstr(name, "global_invocation_id") ||
                 (strstr(name, "num_workgroups") && in->intrinsic != nir_intrinsic_load_num_workgroups) ||
@@ -3198,7 +3207,7 @@ radv_bc250_split_mesh(nir_shader *mesh, nir_shader *task, nir_shader *fs, bool d
                return bc250_split_reject("volatile access");
             if (in->intrinsic == nir_intrinsic_load_shared || in->intrinsic == nir_intrinsic_store_shared) {
                if (nir_intrinsic_access(in) & ACCESS_ATOMIC)
-                  return bc250_split_reject("atomic shared load/store");
+                  shared_atomics = true;
                continue;
             }
             if (in->intrinsic == nir_intrinsic_store_deref || in->intrinsic == nir_intrinsic_copy_deref) {
@@ -3220,6 +3229,14 @@ radv_bc250_split_mesh(nir_shader *mesh, nir_shader *task, nir_shader *fs, bool d
          }
       }
    }
+   if (shared_atomics && pieces > 1) {
+      const char *hazard = radv_bc250_split_shared_atomic_hazard(mesh);
+      if (hazard)
+         return bc250_split_reject(hazard);
+   }
+   if (shared_atomics && debug_get_bool_option("BC250_TRACE_COMPILE", false))
+      fprintf(stderr, "BC250 split shared atomics admitted: pieces=%u (%s)\n", pieces,
+              pieces == 1 ? "single piece" : "primitive slicing proven independent");
    if (external_atomics && reads_external)
       return bc250_split_reject("external atomic with external memory reads");
    if (external_stores && reads_storage)

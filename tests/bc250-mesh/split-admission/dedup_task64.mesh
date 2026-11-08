@@ -1,0 +1,25 @@
+#version 460
+#extension GL_EXT_mesh_shader : require
+// Shape of the refused NX2navi pipelines: Task + Mesh, 128 lanes (several waves: the atomics survive; one-wave workgroups get them folded into scans), V=128 P=64,
+// one per-primitive output, vertex dedup through a shared atomicCompSwap table.
+// One piece at 64 primitives: the body runs once, so the atomics are safe.
+layout(local_size_x=128) in;
+layout(triangles, max_vertices=128, max_primitives=64) out;
+layout(location=0) perprimitiveEXT flat out vec4 pcol[];
+struct P { uint base; }; taskPayloadSharedEXT P pl;
+shared uint table[128];
+
+void main(){
+ uint i=gl_LocalInvocationIndex;
+ for(uint v=i; v<128u; v+=128u) table[v]=0u;
+ barrier();
+ for(uint v=i; v<128u; v+=128u) atomicCompSwap(table[(v*7u)%128u], 0u, v+1u);
+ barrier();
+ SetMeshOutputsEXT(128,64);
+ for(uint v=i; v<128u; v+=128u) gl_MeshVerticesEXT[v].gl_Position=vec4(float(v%16u)/8.0-1.0,float(v/16u)/8.0-1.0,0.5,1);
+ for(uint p=i; p<64u; p+=128u) {
+   uint a=table[p]%128u, b=table[p+1u]%128u, c=table[p+2u]%128u;
+   gl_PrimitiveTriangleIndicesEXT[p]=uvec3(a,b,c);
+   pcol[p]=vec4(float(p)/255.0,float(pl.base),1,1);
+ }
+}

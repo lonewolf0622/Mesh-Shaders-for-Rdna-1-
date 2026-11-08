@@ -4,6 +4,11 @@
 #include <stdlib.h>
 #include <string.h>
 
+#include "util/bitset.h"
+#include "util/hash_table.h"
+#include "util/set.h"
+#include "util/u_dynarray.h"
+
 bool
 radv_bc250_mesh_intrinsic_subgroup_op(const nir_intrinsic_instr *in)
 {
@@ -477,4 +482,365 @@ radv_bc250_mesh_contract_init(const nir_shader *mesh, struct radv_bc250_mesh_con
       free(dependencies);
    }
    c->output_dependencies_unknown |= c->has_calls;
+}
+
+/* Split admission with workgroup-shared atomics (radv_bc250_split_mesh).
+ *
+ * The split runs the whole Mesh body once per piece, each piece in its own
+ * workgroup, and keeps one slice of the primitive array from each piece. The
+ * completion order of shared atomics may differ between pieces, so every value
+ * that can depend on it ("tainted") may differ too. The pieces still agree on
+ * the final picture as long as the slicing itself is the same in every piece:
+ *
+ *  - the primitive count, each per-primitive output's slot, and whether a
+ *    per-primitive store runs at all must not be tainted;
+ *  - per-primitive output values must not be tainted, except the primitive's
+ *    vertex indices: every piece exports all of its own vertices from the same
+ *    execution, so its indices and vertex outputs are consistent with each other.
+ *
+ * Taint sources: shared atomic results, atomic shared loads, and plain shared
+ * loads whose byte range may overlap a range that an atomic, or a store of a
+ * tainted value (or under tainted control), may write. Taint flows through every
+ * SSA source, through phis after a branch on a tainted value, through every value
+ * defined in a loop whose exit may depend on a tainted value, and through
+ * function-temporary variables. Address ranges come from the constant part of
+ * the offset (lower bound) and nir_unsigned_upper_bound (upper bound); an
+ * unbounded address overlaps everything.
+ */
+struct bc250_split_taint {
+   nir_shader *shader;
+   struct hash_table *range_ht;
+   BITSET_WORD *defs;
+   struct set *vars;
+   bool all_temps;
+   bool outputs;
+   struct util_dynarray ranges; /* uint32_t lo, hi pairs */
+   bool changed;
+   const char *failure;
+};
+
+static bool
+bc250_taint_def(struct bc250_split_taint *t, const nir_def *def)
+{
+   return BITSET_TEST(t->defs, def->index);
+}
+
+static void
+bc250_taint_set(struct bc250_split_taint *t, const nir_def *def)
+{
+   if (!BITSET_TEST(t->defs, def->index)) {
+      BITSET_SET(t->defs, def->index);
+      t->changed = true;
+   }
+}
+
+static bool
+bc250_taint_src_cb(nir_src *src, void *data)
+{
+   struct bc250_split_taint *t = data;
+   return !bc250_taint_def(t, src->ssa); /* stop at the first tainted source */
+}
+
+static bool
+bc250_taint_srcs(struct bc250_split_taint *t, nir_instr *instr)
+{
+   return !nir_foreach_src(instr, bc250_taint_src_cb, t);
+}
+
+static void
+bc250_shared_range(struct bc250_split_taint *t, nir_intrinsic_instr *in, nir_src *offset, unsigned bytes,
+                   uint32_t *lo, uint32_t *hi)
+{
+   const uint64_t base = nir_intrinsic_has_base(in) ? nir_intrinsic_base(in) : 0;
+   uint64_t low = base;
+   nir_scalar s = nir_get_scalar(offset->ssa, 0);
+   while (true) {
+      if (nir_scalar_is_const(s)) {
+         low += nir_scalar_as_uint(s);
+         break;
+      }
+      if (!nir_scalar_is_alu(s) || nir_scalar_alu_op(s) != nir_op_iadd)
+         break;
+      nir_scalar a = nir_scalar_chase_alu_src(s, 0), c = nir_scalar_chase_alu_src(s, 1);
+      if (nir_scalar_is_const(a)) {
+         low += nir_scalar_as_uint(a);
+         s = c;
+      } else if (nir_scalar_is_const(c)) {
+         low += nir_scalar_as_uint(c);
+         s = a;
+      } else {
+         break;
+      }
+   }
+   const uint32_t ub = nir_unsigned_upper_bound(t->shader, t->range_ht, nir_get_scalar(offset->ssa, 0));
+   const uint64_t high = ub == UINT32_MAX ? UINT32_MAX : MIN2(base + ub + bytes, UINT32_MAX);
+   *lo = (uint32_t)MIN2(low, UINT32_MAX);
+   *hi = (uint32_t)high;
+   if (*lo >= *hi)
+      *lo = 0;
+}
+
+static void
+bc250_taint_add_range(struct bc250_split_taint *t, uint32_t lo, uint32_t hi)
+{
+   const uint32_t *r = t->ranges.data;
+   const unsigned n = util_dynarray_num_elements(&t->ranges, uint32_t) / 2;
+   for (unsigned i = 0; i < n; i++) {
+      if (r[2 * i] <= lo && r[2 * i + 1] >= hi)
+         return;
+   }
+   util_dynarray_append(&t->ranges, lo);
+   util_dynarray_append(&t->ranges, hi);
+   t->changed = true;
+}
+
+static bool
+bc250_taint_overlaps(struct bc250_split_taint *t, uint32_t lo, uint32_t hi)
+{
+   const uint32_t *r = t->ranges.data;
+   const unsigned n = util_dynarray_num_elements(&t->ranges, uint32_t) / 2;
+   for (unsigned i = 0; i < n; i++) {
+      if (lo < r[2 * i + 1] && r[2 * i] < hi)
+         return true;
+   }
+   return false;
+}
+
+static void
+bc250_taint_fail(struct bc250_split_taint *t, const char *why)
+{
+   if (!t->failure)
+      t->failure = why;
+}
+
+static bool
+bc250_taint_deref_indices(struct bc250_split_taint *t, nir_deref_instr *d)
+{
+   for (; d && d->deref_type != nir_deref_type_var; d = nir_deref_instr_parent(d)) {
+      if ((d->deref_type == nir_deref_type_array || d->deref_type == nir_deref_type_ptr_as_array) &&
+          bc250_taint_def(t, d->arr.index.ssa))
+         return true;
+   }
+   return false;
+}
+
+static void
+bc250_taint_temp(struct bc250_split_taint *t, nir_deref_instr *d)
+{
+   nir_variable *var = nir_deref_instr_get_variable(d);
+   if (!var) {
+      if (!t->all_temps)
+         t->changed = true;
+      t->all_temps = true;
+   } else if (!_mesa_set_search(t->vars, var)) {
+      _mesa_set_add(t->vars, var);
+      t->changed = true;
+   }
+}
+
+static void
+bc250_taint_store_output(struct bc250_split_taint *t, nir_intrinsic_instr *in, nir_deref_instr *d,
+                         nir_variable *var, bool ctrl)
+{
+   const bool value = bc250_taint_def(t, in->src[1].ssa);
+   const bool index = bc250_taint_deref_indices(t, d);
+   const bool primitive = var->data.per_primitive || var->data.location == VARYING_SLOT_PRIMITIVE_INDICES;
+   if (!primitive) {
+      if ((value || index || ctrl) && !t->outputs) {
+         t->outputs = true;
+         t->changed = true;
+      }
+      return;
+   }
+   if (ctrl)
+      bc250_taint_fail(t, "shared atomics control a per-primitive store");
+   else if (index)
+      bc250_taint_fail(t, "shared atomics select a per-primitive slot");
+   else if (value && var->data.location != VARYING_SLOT_PRIMITIVE_INDICES)
+      bc250_taint_fail(t, "shared atomics reach a per-primitive output");
+}
+
+static void
+bc250_taint_intrinsic(struct bc250_split_taint *t, nir_intrinsic_instr *in, bool ctrl)
+{
+   const bool srcs = bc250_taint_srcs(t, &in->instr);
+   switch (in->intrinsic) {
+   case nir_intrinsic_shared_atomic:
+   case nir_intrinsic_shared_atomic_swap: {
+      uint32_t lo, hi;
+      bc250_shared_range(t, in, &in->src[0], in->def.bit_size / 8, &lo, &hi);
+      bc250_taint_add_range(t, lo, hi);
+      bc250_taint_set(t, &in->def);
+      return;
+   }
+   case nir_intrinsic_load_shared: {
+      uint32_t lo, hi;
+      bc250_shared_range(t, in, &in->src[0], in->def.num_components * in->def.bit_size / 8, &lo, &hi);
+      if (srcs || (nir_intrinsic_access(in) & ACCESS_ATOMIC) || bc250_taint_overlaps(t, lo, hi))
+         bc250_taint_set(t, &in->def);
+      return;
+   }
+   case nir_intrinsic_store_shared:
+      if (ctrl || srcs || (nir_intrinsic_access(in) & ACCESS_ATOMIC)) {
+         uint32_t lo, hi;
+         if (bc250_taint_def(t, in->src[1].ssa)) {
+            lo = 0;
+            hi = UINT32_MAX;
+         } else {
+            bc250_shared_range(t, in, &in->src[1], in->src[0].ssa->num_components * in->src[0].ssa->bit_size / 8,
+                               &lo, &hi);
+         }
+         bc250_taint_add_range(t, lo, hi);
+      }
+      return;
+   case nir_intrinsic_set_vertex_and_primitive_count:
+      if (ctrl || bc250_taint_def(t, in->src[1].ssa))
+         bc250_taint_fail(t, "shared atomics reach the primitive count");
+      return;
+   case nir_intrinsic_load_deref: {
+      nir_deref_instr *d = nir_src_as_deref(in->src[0]);
+      nir_variable *var = nir_deref_instr_get_variable(d);
+      bool tainted = srcs;
+      if (nir_deref_mode_is(d, nir_var_shader_out))
+         tainted |= t->outputs;
+      else if (nir_deref_mode_may_be(d, nir_var_function_temp | nir_var_shader_temp))
+         tainted |= t->all_temps || !var || _mesa_set_search(t->vars, var);
+      else if (nir_deref_mode_may_be(d, nir_var_mem_shared))
+         tainted = true;
+      if (tainted)
+         bc250_taint_set(t, &in->def);
+      return;
+   }
+   case nir_intrinsic_store_deref: {
+      nir_deref_instr *d = nir_src_as_deref(in->src[0]);
+      nir_variable *var = nir_deref_instr_get_variable(d);
+      if (nir_deref_mode_is(d, nir_var_shader_out)) {
+         if (!var)
+            bc250_taint_fail(t, "indirect output store");
+         else
+            bc250_taint_store_output(t, in, d, var, ctrl);
+      } else if (nir_deref_mode_may_be(d, nir_var_mem_shared)) {
+         bc250_taint_fail(t, "shared deref store");
+      } else if (ctrl || srcs) {
+         bc250_taint_temp(t, d);
+      }
+      return;
+   }
+   case nir_intrinsic_copy_deref:
+      bc250_taint_fail(t, "copy_deref");
+      return;
+   default:
+      if (nir_intrinsic_infos[in->intrinsic].has_dest && (srcs || ctrl))
+         bc250_taint_set(t, &in->def);
+      return;
+   }
+}
+
+static void
+bc250_taint_block(struct bc250_split_taint *t, nir_block *block, bool ctrl, bool phis)
+{
+   nir_foreach_instr(instr, block) {
+      switch (instr->type) {
+      case nir_instr_type_phi:
+         if (phis || bc250_taint_srcs(t, instr))
+            bc250_taint_set(t, &nir_instr_as_phi(instr)->def);
+         break;
+      case nir_instr_type_intrinsic:
+         bc250_taint_intrinsic(t, nir_instr_as_intrinsic(instr), ctrl);
+         break;
+      case nir_instr_type_alu:
+      case nir_instr_type_tex:
+      case nir_instr_type_deref: {
+         nir_def *def = nir_instr_def(instr);
+         if (def && (ctrl || bc250_taint_srcs(t, instr)))
+            bc250_taint_set(t, def);
+         break;
+      }
+      case nir_instr_type_call:
+         bc250_taint_fail(t, "uninlined call");
+         break;
+      default:
+         break;
+      }
+   }
+}
+
+static bool
+bc250_taint_branch_in(struct bc250_split_taint *t, struct exec_list *list)
+{
+   foreach_list_typed (nir_cf_node, node, node, list) {
+      if (node->type == nir_cf_node_if) {
+         nir_if *nif = nir_cf_node_as_if(node);
+         if (bc250_taint_def(t, nif->condition.ssa) || bc250_taint_branch_in(t, &nif->then_list) ||
+             bc250_taint_branch_in(t, &nif->else_list))
+            return true;
+      } else if (node->type == nir_cf_node_loop) {
+         if (bc250_taint_branch_in(t, &nir_cf_node_as_loop(node)->body))
+            return true;
+      }
+   }
+   return false;
+}
+
+static void
+bc250_taint_cf(struct bc250_split_taint *t, struct exec_list *list, bool ctrl)
+{
+   bool phis = false;
+   foreach_list_typed (nir_cf_node, node, node, list) {
+      switch (node->type) {
+      case nir_cf_node_block:
+         bc250_taint_block(t, nir_cf_node_as_block(node), ctrl, phis);
+         phis = false;
+         break;
+      case nir_cf_node_if: {
+         nir_if *nif = nir_cf_node_as_if(node);
+         const bool tainted = ctrl || bc250_taint_def(t, nif->condition.ssa);
+         bc250_taint_cf(t, &nif->then_list, tainted);
+         bc250_taint_cf(t, &nif->else_list, tainted);
+         phis = tainted;
+         break;
+      }
+      case nir_cf_node_loop: {
+         nir_loop *loop = nir_cf_node_as_loop(node);
+         /* Values defined in such a loop (and its phis) depend on the trip count. */
+         const bool tainted = ctrl || bc250_taint_branch_in(t, &loop->body);
+         bc250_taint_cf(t, &loop->body, tainted);
+         phis = tainted;
+         break;
+      }
+      default:
+         bc250_taint_fail(t, "unexpected control flow");
+         break;
+      }
+   }
+}
+
+const char *
+radv_bc250_split_shared_atomic_hazard(nir_shader *mesh)
+{
+   nir_function_impl *impl = nir_shader_get_entrypoint(mesh);
+   if (!impl)
+      return "no entrypoint";
+   nir_index_ssa_defs(impl);
+   struct bc250_split_taint t = {
+      .shader = mesh,
+      .range_ht = _mesa_pointer_hash_table_create(NULL),
+      .defs = calloc(BITSET_WORDS(impl->ssa_alloc), sizeof(BITSET_WORD)),
+      .vars = _mesa_pointer_set_create(NULL),
+   };
+   util_dynarray_init(&t.ranges, NULL);
+   if (!t.defs) {
+      t.failure = "out of memory";
+   } else {
+      do {
+         t.changed = false;
+         bc250_taint_cf(&t, &impl->body, false);
+      } while (t.changed && !t.failure);
+   }
+   const char *failure = t.failure;
+   util_dynarray_fini(&t.ranges);
+   _mesa_set_destroy(t.vars, NULL);
+   _mesa_hash_table_destroy(t.range_ht, NULL);
+   free(t.defs);
+   return failure;
 }

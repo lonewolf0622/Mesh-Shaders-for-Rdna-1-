@@ -37,18 +37,22 @@ for s in "$here"/*.mesh; do
   glslangValidator -S mesh --target-env vulkan1.3 -o "$work/$(basename "$s" .mesh).spv" "$s" >/dev/null || exit 2
 done
 glslangValidator -S task --target-env vulkan1.3 -o "$work/t.spv" "$here/t.task" >/dev/null || exit 2
-glslangValidator -S frag --target-env vulkan1.3 -o "$work/f.spv" "$here/f.frag" >/dev/null || exit 2
+for s in "$here"/*.frag; do
+  glslangValidator -S frag --target-env vulkan1.3 -o "$work/$(basename "$s" .frag).frag.spv" "$s" >/dev/null || exit 2
+done
 
 fail=0
 # name | mesh | task (- for none) | extra env | expected result | expected message (grep -F, or -)
 while IFS='|' read -r name mesh task extra want msg; do
   [ -z "$name" ] && continue
   case "$name" in \#*) continue;; esac
+  # A mesh fixture with its own <mesh>.frag is paired with it; the others use f.frag.
+  frag=f.frag.spv; [ -f "$here/$mesh.frag" ] && frag="$mesh.frag.spv"
   if [ "$task" = - ]; then
-    out=$(cd "$work" && shim env $extra ./pipe "$mesh.spv" f.spv 2>&1)
+    out=$(cd "$work" && shim env $extra ./pipe "$mesh.spv" "$frag" 2>&1)
     got=$(printf '%s\n' "$out" | sed -n 's/^PIPELINE_RESULT=//p' | tail -1)
   else
-    out=$(cd "$work" && shim env $extra ./mkpipe "$mesh.spv" f.spv "$task.spv" 3 2>&1)
+    out=$(cd "$work" && shim env $extra ./mkpipe "$mesh.spv" "$frag" "$task.spv" 3 2>&1)
     got=$(printf '%s\n' "$out" | sed -n 's/^RESULT //p' | tail -1)
   fi
   why=$(printf '%s\n' "$out" | grep -o 'split rejected: .*' | head -1)
@@ -80,6 +84,13 @@ tri64_cull_shared|tri64_cull_shared|-||-8|split rejected: store_ssbo
 tri256_barrier|tri256_barrier|-||-8|split rejected: store_ssbo
 tri128_numwg|tri128_numwg|-||-8|split rejected: store_ssbo
 tri128_atomic|tri128_atomic|-||0|external atomics: 1 guarded to the first piece
-tri128_shatomic|tri128_shatomic|-||-8|split rejected: shared_atomic
+# shared atomics whose result nothing reads: admitted (no taint reaches the primitives)
+tri128_shatomic|tri128_shatomic|-||0|split shared atomics admitted: pieces=2
+# shared atomics behind Task (the shape of the refused NX2navi pipelines)
+dedup_task64|dedup_task64|t||0|MESH SAFE OWNED
+dedup_task128|dedup_task128|t||0|split shared atomics admitted: pieces=2 (primitive slicing proven independent)
+dedup_task64_wide|dedup_task64_wide|t||0|-
+dedup_task128_wide|dedup_task128_wide|t||0|split shared atomics admitted
+compact_task128|compact_task128|t||-8|split rejected: shared atomics select a per-primitive slot
 EOF
 exit $fail

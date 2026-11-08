@@ -85,6 +85,12 @@ void radv_bc250_analyze_mesh_contract(nir_shader *mesh, struct radv_bc250_mesh_c
  */
 bool radv_bc250_mesh_allocation_is_canonical(const struct radv_bc250_mesh_contract *contract);
 
+/* Split admission with shared atomics: NULL when the primitive count, every per-primitive slot and
+ * store, and every per-primitive output value except the vertex indices are proven independent of
+ * the completion order of shared atomics (so all pieces slice the same primitives); otherwise the
+ * reason. Re-indexes SSA defs; does not change instructions. */
+const char *radv_bc250_split_shared_atomic_hazard(nir_shader *mesh);
+
 #ifdef __cplusplus
 }
 #endif

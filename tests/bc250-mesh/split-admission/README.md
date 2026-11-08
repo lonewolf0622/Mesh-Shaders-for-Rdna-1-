@@ -27,6 +27,38 @@ Final NIR evidence, from `BC250_TRACE_SPLIT_NIR=1`, which prints the NIR after t
 - `numwg_task` (hybrid Task): `NumWorkGroups.x = udiv(load_num_workgroups.x, 3)`, and y and z are unchanged.
 - `tri128_atomic` and `atomic_cull_shared64`: the `ssbo_atomic` is inside `if (umod(workgroup_index, pieces) * limit == 0)`.
 
+## Shared atomics (class 4)
+
+Shared atomics and atomic shared loads/stores were refused outright. Their results depend on the order the
+atomics complete in, which may differ between pieces. They are now admitted in two cases:
+
+1. **One piece.** The body runs exactly once per original workgroup, as without the split.
+2. **Several pieces, when the slicing is proven independent of the atomics**
+   (`radv_bc250_split_shared_atomic_hazard`, unit-tested in `radv_bc250_mesh_contract_tests.cpp`). The primitive
+   count, every per-primitive slot, whether each per-primitive store runs, and every per-primitive value except the
+   vertex indices must not depend on an atomic result. Vertex indices and vertex outputs may: each piece exports all
+   of its own vertices from the same execution. Taint flows through SSA sources, phis after tainted branches, loops
+   whose exit depends on taint, temporaries, and shared loads whose byte range may overlap a range an atomic (or a
+   tainted store) writes. Ranges use the constant part of the address and `nir_unsigned_upper_bound`.
+
+One-wave workgroups are not a useful test: Mesa folds their shared atomics into subgroup scans before the split
+sees them. The fixtures use 128 lanes.
+
+| Case | 975ec91 | Now |
+|---|---|---|
+| tri128_shatomic (atomic result unused, 2 pieces) | -8 shared_atomic | 0 |
+| dedup_task64 (Task, V=128 P=64, compare-swap dedup) | 0 (safe owned route) | 0 (unchanged) |
+| dedup_task128 (Task, V=160 P=128, dedup, header broadcast, 2 pieces) | -8 shared_atomic_swap | 0 |
+| compact_task128 (Task, primitive compaction through a shared counter) | -8 shared_atomic | -8 shared atomics select a per-primitive slot |
+| dedup_task64_wide (as reported: 13 KB shared, 10 vertex outputs) | -8 shared_atomic_swap | -8 required vertex expansion unavailable |
+| dedup_task128_wide (13 KB shared, 10 vertex outputs, P=128) | -8 shared_atomic_swap | -8 required vertex expansion unavailable |
+
+The wide cases now pass the atomics check but exceed the expansion's 28 KiB staging limit (application shared memory
+plus every output array) at every piece count from 1 to 5: each piece stages all vertices. That limit is the NGG Mesh
+LDS window, not the split, and needs a different route.
+
+Older rows of `run.sh` print trace messages that predate the current driver; their results match `975ec91`.
+
 ## Results
 
 These results use the the base driver launcher policy, run in bwrap with `/dev/dri` hidden under the noop drm-shim (GFX1013), with `NIR_DEBUG=validate ACO_DEBUG=validateir,validatera`. Pipelines are created and a draw is recorded. Nothing is ever submitted.

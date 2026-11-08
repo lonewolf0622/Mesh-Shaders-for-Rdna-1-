@@ -1,0 +1,31 @@
+#version 460
+#extension GL_EXT_mesh_shader : require
+// With 13 KB of shared memory and 10 vertex outputs, V=160 P=128 (two pieces): the atomics only reach the
+// vertex index values, so every piece slices the same primitives.
+layout(local_size_x=128) in;
+layout(triangles, max_vertices=160, max_primitives=128) out;
+layout(location=0) perprimitiveEXT flat out vec4 pcol[];
+layout(location=1) out vec4 attr[][10];
+struct P { uint base; }; taskPayloadSharedEXT P pl;
+shared uint header[4];
+shared uint table[160];
+shared uint scratch[3120]; // about 13 KB of application shared memory, as in the report
+
+void main(){
+ uint i=gl_LocalInvocationIndex;
+ if(i==0u) header[0]=pl.base%129u;
+ for(uint v=i; v<160u; v+=128u) table[v]=0u;
+ barrier();
+ for(uint v=i; v<160u; v+=128u) atomicCompSwap(table[(v*7u)%160u], 0u, v+1u);
+ barrier();
+ uint np=min(header[0],128u);
+ SetMeshOutputsEXT(160,np);
+ for(uint v=i; v<3120u; v+=128u) scratch[v]=v;
+ for(uint v=i; v<160u; v+=128u) for(uint k=0u; k<10u; k++) attr[v][k]=vec4(float(v),float(k),float(table[v]),float(scratch[v*7u]));
+ for(uint v=i; v<160u; v+=128u) gl_MeshVerticesEXT[v].gl_Position=vec4(float(v%16u)/8.0-1.0,float(v/16u)/10.0-1.0,0.5,1);
+ for(uint p=i; p<128u; p+=128u) {
+   uint a=table[p]%160u, b=table[p+1u]%160u, c=table[p+2u]%160u;
+   gl_PrimitiveTriangleIndicesEXT[p]=uvec3(a,b,c);
+   pcol[p]=vec4(float(p)/255.0,float(pl.base),1,1);
+ }
+}
