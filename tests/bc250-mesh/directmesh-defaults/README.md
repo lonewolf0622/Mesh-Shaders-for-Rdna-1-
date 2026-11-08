@@ -13,16 +13,16 @@ Build `src/amd/vulkan/libvulkan_radeon.so` and `src/amd/vulkan/radv_tests` in an
 existing configured Mesa build. Choose a fresh evidence directory. Example paths:
 
 ```sh
-src=/home/deck/mesh-test/directmesh-mesh-contract
-build=/home/deck/mesh-test/directmesh-mesh-contract-build
-out=/home/deck/mesh-test/directmesh-v131-rdna-evidence
-fixtures=/home/deck/mesh-test/directmesh-auto-final-evidence/fixtures
+src=<mesa source tree>
+build=<mesa build dir>
+out=<new evidence dir>
+fixtures=<automatic-route fixtures dir>
 cd "$src"
 python3 tests/bc250-mesh/directmesh-defaults/build_noop.py --build "$build" --out "$out/noop"
 cc -O2 tests/bc250-mesh/directmesh-defaults/probe.c -o "$out/probe" -lvulkan
 cc -O2 tests/bc250-mesh/index-pass/index_gate.c -o "$out/index_gate" -lvulkan
 "$build/src/amd/vulkan/radv_tests" > "$out/unit.log"
-python3 tests/bc250-mesh/directmesh-defaults/check.py --build "$build" --fixtures "$fixtures" --out "$out" --baseline-icd /home/deck/mesh-test/releases/directmesh-default-rdna1-74d1bc1/radeon_icd.json --baseline-label 74d1bc1
+python3 tests/bc250-mesh/directmesh-defaults/check.py --build "$build" --fixtures "$fixtures" --out "$out" --baseline-icd <released radeon_icd.json> --baseline-label <release>
 python3 tests/bc250-mesh/directmesh-defaults/extended.py --build "$build" --out "$out"
 ```
 

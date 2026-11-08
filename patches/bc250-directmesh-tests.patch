@@ -5273,10 +5273,10 @@ index 0000000..d56f12b
 +(o/'summary.json').write_text(json.dumps({'merged_root_constants':True,'options':['a','b'],'cpu_cases':64},indent=2)+'\n');print('Merged Mesh DGC PASS')
 diff --git a/tests/bc250-mesh/dgc/nir_interpreter.h b/tests/bc250-mesh/dgc/nir_interpreter.h
 new file mode 100644
-index 0000000..f0f1b92
+index 0000000..2da075a
 --- /dev/null
 +++ b/tests/bc250-mesh/dgc/nir_interpreter.h
-@@ -0,0 +1,327 @@
+@@ -0,0 +1,350 @@
 +/*
 + * Copyright © 2026 Valve Corporation
 + *
@@ -5464,6 +5464,29 @@ index 0000000..f0f1b92
 +            out[c] = 0;
 +            memcpy(&out[c], shared_memory.data() + off + c * bytes, bytes);
 +         }
++         break;
++      }
++      case nir_intrinsic_shared_atomic:
++      case nir_intrinsic_shared_atomic_swap: {
++         /* Invocations run one after another, so atomics are sequential. */
++         const unsigned bytes = i->def.bit_size / 8;
++         const uint64_t off = src(i->src[0]) + nir_intrinsic_base(i);
++         check(bytes == 4 && off + 4 <= shared_memory.size(), "shared atomic out of bounds");
++         uint32_t old = 0;
++         memcpy(&old, shared_memory.data() + off, 4);
++         uint32_t value = old;
++         const uint32_t data = src(i->src[1]);
++         switch (nir_intrinsic_atomic_op(i)) {
++         case nir_atomic_op_iadd: value = old + data; break;
++         case nir_atomic_op_xchg: value = data; break;
++         case nir_atomic_op_umax: value = old > data ? old : data; break;
++         case nir_atomic_op_umin: value = old < data ? old : data; break;
++         case nir_atomic_op_ior: value = old | data; break;
++         case nir_atomic_op_cmpxchg: value = old == data ? (uint32_t)src(i->src[2]) : old; break;
++         default: check(false, "unsupported shared atomic");
++         }
++         memcpy(shared_memory.data() + off, &value, 4);
++         out[0] = old;
 +         break;
 +      }
 +      case nir_intrinsic_store_shared: {
@@ -6172,10 +6195,10 @@ index 0000000..85cb600
 +int main(int argc,char **argv) { int r=ordinary_fixture(argc,argv);return r ? r : dgc_failed; }
 diff --git a/tests/bc250-mesh/dgc/run.py b/tests/bc250-mesh/dgc/run.py
 new file mode 100644
-index 0000000..aa4bc14
+index 0000000..2c413dd
 --- /dev/null
 +++ b/tests/bc250-mesh/dgc/run.py
-@@ -0,0 +1,63 @@
+@@ -0,0 +1,67 @@
 +"""Offline Mesh/Task DGC, generated-PM4 interpretation and lifetime checks."""
 +import json, os, re, subprocess
 +from pathlib import Path
@@ -6194,7 +6217,8 @@ index 0000000..aa4bc14
 + return text
 +run(['cc','-O1','-Wall','-o',out/'pipe',src/'tests/bc250-mesh/dgc/pipe.c','-lvulkan'],'build.log')
 +run(['cc','-O1','-Wall','-o',out/'exposure',src/'tests/bc250-mesh/dgc/exposure.c','-lvulkan'],'exposure-build.log')
-+for directmesh, switch, expected in (('0',None,0),('1',None,1),('1','0',0),('1','1',1)):
++# RADV_DIRECTMESH=0 is stock RADV, which exposes its own DGC; the DirectMesh switch only applies with DirectMesh.
++for directmesh, switch, expected in (('0',None,1),('1',None,1),('1','0',0),('1','1',1)):
 + e=dict(base,RADV_DIRECTMESH=directmesh)
 + if switch is None:e.pop('RADV_BC250_EXPOSE_DGC')
 + else:e['RADV_BC250_EXPOSE_DGC']=switch
@@ -6231,14 +6255,17 @@ index 0000000..aa4bc14
 +  print(name,variant,'PASS',flush=True)
 +print('DGC suite PASS',len(rows),'routes',sum(r['cpu_cases'] for r in rows),'CPU cases',flush=True)
 +
-+# The capture scratch ABI is not admitted for concurrent reuse. Recording must
-+# return FEATURE_NOT_PRESENT rather than passing through to generic native PM4.
++# The capture scratch ABI is not admitted for concurrent reuse. The execute is
++# skipped (one warning) rather than passing through to generic native PM4, and the
++# command buffer stays valid: FEATURE_NOT_PRESENT is not a legal vkEndCommandBuffer
++# result and vkd3d-proton treats any error there as fatal.
 +e=dict(base,DGC_REJECT_SIMULT='1')
 +p=subprocess.run([str(out/'pipe'),str(out/'plain/mesh.spv'),str(out/'plain/frag.spv'),'-','1'],env=e,capture_output=True,text=True)
 +text=p.stdout+p.stderr;(out/'refuse-simultaneous.log').write_text(text)
-+assert p.returncode==1 and 'FAIL vkEndCommandBuffer(cb) = -8' in text and 'SUBMIT_OK' not in text,text[-3000:]
++assert 'FAIL vkEndCommandBuffer' not in text and 'DGC_ERROR' not in text,text[-3000:]
++assert text.count('unsupported device-generated commands skipped') == 1,text[-3000:]
 +assert 'raw_unproven' not in text and 'Assertion' not in text
-+print('DGC concurrent reuse fail-closed PASS',flush=True)
++print('DGC concurrent reuse skipped PASS rc=%d'%p.returncode,flush=True)
 diff --git a/tests/bc250-mesh/dgc/run.sh b/tests/bc250-mesh/dgc/run.sh
 new file mode 100644
 index 0000000..7784fac
@@ -10699,7 +10726,7 @@ index 0000000..eecdd86
 +exit $fail
 diff --git a/tests/bc250-mesh/directmesh-defaults/README.md b/tests/bc250-mesh/directmesh-defaults/README.md
 new file mode 100644
-index 0000000..f237abf
+index 0000000..858c31e
 --- /dev/null
 +++ b/tests/bc250-mesh/directmesh-defaults/README.md
 @@ -0,0 +1,40 @@
@@ -10718,16 +10745,16 @@ index 0000000..f237abf
 +existing configured Mesa build. Choose a fresh evidence directory. Example paths:
 +
 +```sh
-+src=/home/deck/mesh-test/directmesh-mesh-contract
-+build=/home/deck/mesh-test/directmesh-mesh-contract-build
-+out=/home/deck/mesh-test/directmesh-v131-rdna-evidence
-+fixtures=/home/deck/mesh-test/directmesh-auto-final-evidence/fixtures
++src=<mesa source tree>
++build=<mesa build dir>
++out=<new evidence dir>
++fixtures=<automatic-route fixtures dir>
 +cd "$src"
 +python3 tests/bc250-mesh/directmesh-defaults/build_noop.py --build "$build" --out "$out/noop"
 +cc -O2 tests/bc250-mesh/directmesh-defaults/probe.c -o "$out/probe" -lvulkan
 +cc -O2 tests/bc250-mesh/index-pass/index_gate.c -o "$out/index_gate" -lvulkan
 +"$build/src/amd/vulkan/radv_tests" > "$out/unit.log"
-+python3 tests/bc250-mesh/directmesh-defaults/check.py --build "$build" --fixtures "$fixtures" --out "$out" --baseline-icd /home/deck/mesh-test/releases/directmesh-default-rdna1-74d1bc1/radeon_icd.json --baseline-label 74d1bc1
++python3 tests/bc250-mesh/directmesh-defaults/check.py --build "$build" --fixtures "$fixtures" --out "$out" --baseline-icd <released radeon_icd.json> --baseline-label <release>
 +python3 tests/bc250-mesh/directmesh-defaults/extended.py --build "$build" --out "$out"
 +```
 +
@@ -10800,10 +10827,10 @@ index 0000000..ed8129a
 +print('Built private shim: real Navi10 capture; synthetic GFX1013/Navi12/Navi14 identities')
 diff --git a/tests/bc250-mesh/directmesh-defaults/check.py b/tests/bc250-mesh/directmesh-defaults/check.py
 new file mode 100644
-index 0000000..028186d
+index 0000000..4f320bb
 --- /dev/null
 +++ b/tests/bc250-mesh/directmesh-defaults/check.py
-@@ -0,0 +1,120 @@
+@@ -0,0 +1,131 @@
 +#!/usr/bin/env python3
 +"""CPU-only default activation and RDNA1 compiler/recording gate. Never renders."""
 +import argparse
@@ -10847,7 +10874,8 @@ index 0000000..028186d
 +    return log
 +
 +for gpu in ('gfx1013', 'gfx1013_143f', 'navi10', 'navi12', 'navi14', 'renoir', 'navi21'):
-+    targeted = gpu in ('gfx1013', 'gfx1013_143f', 'navi10', 'navi12', 'navi14')
++    # Navi 14 is outside DirectMesh until the Mesh-only NGG path has run on that chip.
++    targeted = gpu in ('gfx1013', 'gfx1013_143f', 'navi10', 'navi12')
 +    options = [('default', {}, None), ('explicit', dict(RADV_DIRECTMESH='1'), None),
 +               ('disabled', dict(RADV_DIRECTMESH='0'), None),
 +               ('store-off', dict(RADV_BC250_MESH_IDXPASS_STORE='0'), None),
@@ -10861,11 +10889,15 @@ index 0000000..028186d
 +        log = launch(tag, gpu, [out / 'probe', *([engine] if engine else [])], extra)
 +        probes = [dict(re.findall(r'(\w+)=(\S+)', line)) for line in log.splitlines() if line.startswith('PROBE ')]
 +        assert len(probes) == 2, tag
++        # The preset is never written into the process environment.
++        envs = [dict(re.findall(r'(\w+)=(\S+)', line)) for line in log.splitlines() if line.startswith('PROBE_ENV ')]
++        assert len(envs) == 2 and all(e['perftest'] == 'unset' for e in envs), tag
 +        for result in probes:
 +            if targeted:
 +                assert result['mesh'] == ('0' if label in ('disabled', 'nongg', 'nomesh') else '1'), tag
-+                assert result['preset'] == ('unset' if label == 'disabled' else '1'), tag
-+                assert result['store'] == ('unset' if label == 'disabled' else '0' if label == 'store-off' else 'auto'), tag
++                assert result['preset'] == 'unset', tag
++                assert result['store'] == ('0' if label == 'store-off' else 'unset'), tag
++                assert result['hybrid'] == ('0' if label == 'task-off' else '1' if label == 'dxvk-explicit-task' else 'unset'), tag
 +                if label == 'dxvk':
 +                    assert result['task'] == '0' and result['gpl'] == '1', tag
 +                if label == 'dxvk-explicit-task':
@@ -10873,14 +10905,20 @@ index 0000000..028186d
 +                if label == 'task-off':
 +                    assert result['task'] == '0' and result['gpl'] == '1', tag
 +                if not gpu.startswith('gfx1013'):
-+                    assert result['rt'] == '0', tag
++                    # Emulated ray tracing only with an explicit RADV_DIRECTMESH=1.
++                    assert result['rt'] == ('1' if label == 'explicit' else '0'), tag
++                    assert result['vrs'] == result['mesh'], tag
++                else:
++                    assert result['vrs'] == '1', tag
 +            else:
 +                assert result['preset'] == result['store'] == 'unset' and result['gpl'] == '1', tag
++                if gpu == 'navi14':
++                    assert result['mesh'] == '0', tag
 +        rows.append(dict(case=tag, kind='enumeration', instances=2))
 +        print('PASS', tag, flush=True)
 +
 +cases = automatic.CASES + automatic.SAFETY
-+for gpu in ('gfx1013', 'navi10', 'navi12', 'navi14'):
++for gpu in ('gfx1013', 'navi10', 'navi12'):
 +    for case in cases:
 +        extra = dict(BC250_TRACE_COMPILE='1', BC250_TRACE_USAGE='1', BC250_IDX_TRACE='1',
 +                     BC250_IDX_CAPTURE_BATCH='1', BC250_CAPTURE_POLICY_SHADERS='1', RADV_DEBUG='dumpibs',
@@ -10926,10 +10964,10 @@ index 0000000..028186d
 +print('PASS', result['launches'], 'noop launches; no GPU execution')
 diff --git a/tests/bc250-mesh/directmesh-defaults/extended.py b/tests/bc250-mesh/directmesh-defaults/extended.py
 new file mode 100644
-index 0000000..0e4a4e9
+index 0000000..e7c6b03
 --- /dev/null
 +++ b/tests/bc250-mesh/directmesh-defaults/extended.py
-@@ -0,0 +1,101 @@
+@@ -0,0 +1,98 @@
 +#!/usr/bin/env python3
 +"""Compile Task, per-primitive, barycentric and fallback cases without a GPU."""
 +import argparse
@@ -10990,7 +11028,8 @@ index 0000000..0e4a4e9
 +    configs.append((frag, 'barymesh', frag, None, dict(RADV_BC250_MESH_IDXPASS='0')))
 +configs.append(('primid', 'primidmesh', 'primidfrag', None, dict(RADV_BC250_MESH_IDXPASS='0')))
 +rows = []
-+for gpu in ('gfx1013', 'navi10', 'navi12', 'navi14'):
++# Navi 14 is outside DirectMesh (check.py asserts Mesh stays hidden there).
++for gpu in ('gfx1013', 'navi10', 'navi12'):
 +    for label, mesh, frag, task, extra in configs:
 +        tag = gpu + '-' + label
 +        env = dict(PATH='/usr/bin', HOME='/tmp', LD_PRELOAD=str(out/'noop/libamdgpu_noop_drm_shim.so'),
@@ -11023,20 +11062,16 @@ index 0000000..0e4a4e9
 +            assert any(k == 'pool' and d == 'GTT' and c == '1' for k,d,c,w,n in allocations), tag
 +        if label in ('query','multiview'):
 +            assert 'idx_direct=0 ' in log, tag
-+        if gpu == 'navi14' and label not in ('reference', 'query'):
-+            late = re.findall(r'SPI_SHADER_LATE_ALLOC_GS = (\d+)',log)
-+            assert set(late) <= {'0'}, 'Navi14 late allocation: '+tag
-+            assert late or re.search(r'idx_direct=[1-9]', log), 'missing Navi14 stage evidence: '+tag
 +        rows.append(dict(case=tag,validation_errors=0))
 +        print('PASS',tag,flush=True)
 +(out/'extended-summary.json').write_text(json.dumps(dict(status='PASS',launches=len(rows),GPU_runs=0,cases=rows),indent=2)+'\n')
 +print('PASS',len(rows),'extended noop launches; no GPU execution')
 diff --git a/tests/bc250-mesh/directmesh-defaults/probe.c b/tests/bc250-mesh/directmesh-defaults/probe.c
 new file mode 100644
-index 0000000..c33cd4c
+index 0000000..d21dedb
 --- /dev/null
 +++ b/tests/bc250-mesh/directmesh-defaults/probe.c
-@@ -0,0 +1,44 @@
+@@ -0,0 +1,47 @@
 +/* SPDX-License-Identifier: MIT
 + * Enumeration only. The runner requires a fresh /dev and the noop DRM shim. */
 +#include <vulkan/vulkan.h>
@@ -11066,16 +11101,19 @@ index 0000000..c33cd4c
 +      vkEnumerateDeviceExtensionProperties(pd, NULL, &count, NULL);
 +      VkExtensionProperties *ext = calloc(count, sizeof(*ext));
 +      if (vkEnumerateDeviceExtensionProperties(pd, NULL, &count, ext)) return 6;
-+      int gpl = 0, rt = 0;
++      int gpl = 0, rt = 0, vrs = 0;
 +      for (unsigned i = 0; i < count; i++) {
 +         gpl |= !strcmp(ext[i].extensionName, "VK_EXT_graphics_pipeline_library");
 +         rt |= !strcmp(ext[i].extensionName, "VK_KHR_ray_tracing_pipeline");
++         vrs |= !strcmp(ext[i].extensionName, "VK_KHR_fragment_shading_rate");
 +      }
-+      printf("PROBE iteration=%u device=%04x mesh=%u task=%u gpl=%d rt=%d preset=%s store=%s hybrid=%s\n",
-+             iteration, prop.deviceID, mesh.meshShader, mesh.taskShader, gpl, rt,
++      printf("PROBE iteration=%u device=%04x mesh=%u task=%u gpl=%d rt=%d vrs=%d preset=%s store=%s hybrid=%s\n",
++             iteration, prop.deviceID, mesh.meshShader, mesh.taskShader, gpl, rt, vrs,
 +             getenv("RADV_BC250_MESH_SAFE_FAST") ?: "unset",
 +             getenv("RADV_BC250_MESH_IDXPASS_STORE") ?: "unset",
 +             getenv("RADV_BC250_HYBRID_TASK") ?: "unset");
++      /* The driver must never write the environment (perftest included). */
++      printf("PROBE_ENV iteration=%u perftest=%s\n", iteration, getenv("RADV_PERFTEST") ?: "unset");
 +      free(ext);
 +      vkDestroyInstance(instance, NULL);
 +   }
@@ -29008,10 +29046,10 @@ index 0000000..13b5e4e
 +}
 diff --git a/tests/bc250-mesh/split-admission/README.md b/tests/bc250-mesh/split-admission/README.md
 new file mode 100644
-index 0000000..6db101f
+index 0000000..d8a220f
 --- /dev/null
 +++ b/tests/bc250-mesh/split-admission/README.md
-@@ -0,0 +1,61 @@
+@@ -0,0 +1,117 @@
 +# Split admission regression (drm-shim only)
 +
 +The base driver's Mesh split (`radv_bc250_split_mesh`) runs the whole Mesh body once per piece, and each piece runs in its own workgroup. Before this change, the admission check refused the application's shared memory (`store_shared`), `load_num_workgroups`, and every external atomic. It now admits three classes:
@@ -29040,6 +29078,62 @@ index 0000000..6db101f
 +- `numwg128` (direct_split, 3 pieces): `load_num_workgroups` is gone. `pcol.xyz` reads `load_global(push_constant[32] + draw_id * push_constant[16]).xyz`, the draw's recorded grid.
 +- `numwg_task` (hybrid Task): `NumWorkGroups.x = udiv(load_num_workgroups.x, 3)`, and y and z are unchanged.
 +- `tri128_atomic` and `atomic_cull_shared64`: the `ssbo_atomic` is inside `if (umod(workgroup_index, pieces) * limit == 0)`.
++
++## Shared atomics (class 4)
++
++Shared atomics and atomic shared loads/stores were refused outright. Their results depend on the order the
++atomics complete in, which may differ between pieces. They are now admitted in two cases:
++
++1. **One piece.** The body runs exactly once per original workgroup, as without the split.
++2. **Several pieces, when the slicing is proven independent of the atomics**
++   (`radv_bc250_split_shared_atomic_hazard`, unit-tested in `radv_bc250_mesh_contract_tests.cpp`). The primitive
++   count, every per-primitive slot, whether each per-primitive store runs, and every per-primitive value except the
++   vertex indices must not depend on an atomic result. Vertex indices and vertex outputs may: each piece exports all
++   of its own vertices from the same execution. Taint flows through SSA sources, phis after tainted branches, loops
++   whose exit depends on taint, temporaries, and shared loads whose byte range may overlap a range an atomic (or a
++   tainted store) writes. Ranges use the constant part of the address and `nir_unsigned_upper_bound`.
++
++One-wave workgroups are not a useful test: Mesa folds their shared atomics into subgroup scans before the split
++sees them. The fixtures use 128 lanes.
++
++| Case | 975ec91 | Now |
++|---|---|---|
++| tri128_shatomic (atomic result unused, 2 pieces) | -8 shared_atomic | 0 |
++| dedup_task64 (Task, V=128 P=64, compare-swap dedup) | 0 (safe owned route) | 0 (unchanged) |
++| dedup_task128 (Task, V=160 P=128, dedup, header broadcast, 2 pieces) | -8 shared_atomic_swap | 0 |
++| compact_task128 (Task, primitive compaction through a shared counter) | -8 shared_atomic | -8 shared atomics select a per-primitive slot |
++| dedup_task64_wide (as reported: 13 KB shared, 10 vertex outputs) | -8 shared_atomic_swap | -8 required vertex expansion unavailable |
++| dedup_task128_wide (13 KB shared, 10 vertex outputs, P=128) | -8 shared_atomic_swap | -8 required vertex expansion unavailable |
++
++The wide cases now pass the atomics check but exceed the expansion's 28 KiB staging limit (application shared memory
++plus every output array) at every piece count from 1 to 5: each piece stages all vertices. That limit is the NGG Mesh
++LDS window, not the split, and needs a different route.
++
++Older rows of `run.sh` print trace messages that predate the current driver; their results match `975ec91`.
++
++## Staging over dead shared memory (class 5)
++
++The expansion copies every output array into shared memory and refuses when application shared memory plus
++those staging arrays exceed 28 KiB. When the budget is exceeded, it now tries to reuse application shared
++memory that is dead before the first output store (`radv_bc250_staging_alias_analyze`, `bc250_staging_alias_*`):
++
++- **Boundary:** the first top-level node that stores an output, or, in a straight-line top-level block, that
++  block's first output store.
++- **Reserved bytes:** every shared access at or after the boundary keeps its bytes. Ranges use the constant part
++  of the address and `nir_unsigned_upper_bound`. An unbounded access keeps everything.
++- **Layout:** staging arrays are split per inner element (`nir_split_array_vars`) and placed largest first into
++  free bytes, possibly continuing past the application region. Variables that code before the boundary touches
++  (the primitive count) stay outside the reused bytes.
++- **Synchronization:** a workgroup barrier at the boundary makes every invocation finish with the old contents
++  first.
++
++Shaders within the budget keep their exact layout.
++
++| Case | Before | Now |
++|---|---|---|
++| early_scratch_task128 (V=160 P=128, 8 outputs, 15 KB scratch used before the outputs) | -8 vertex expansion unavailable | 0, Mesh route, 15360 bytes reused, 24.7 KB LDS |
++| early_scratch_end_task128 (same, other declaration order) | -8 | 0 (Mesa lays out the variables itself) |
++| dedup_task128_wide_np (scratch read while writing outputs) | -8 | -8 (the bytes stay live; Task index route with the switch) |
 +
 +## Results
 +
@@ -29146,6 +29240,414 @@ index 0000000..3c42377
 + gl_PrimitiveTriangleIndicesEXT[i]=uvec3(i,(i+1u)%128u,(i+2u)%128u);
 + pcol[i]=vec4(float(ticket),0,1,1);
 +}
+diff --git a/tests/bc250-mesh/split-admission/compact_task128.mesh b/tests/bc250-mesh/split-admission/compact_task128.mesh
+new file mode 100644
+index 0000000..8a6c641
+--- /dev/null
++++ b/tests/bc250-mesh/split-admission/compact_task128.mesh
+@@ -0,0 +1,22 @@
++#version 460
++#extension GL_EXT_mesh_shader : require
++// Primitive compaction through a shared counter, two pieces: the slot each
++// primitive lands in depends on the atomics' order. Must stay refused.
++layout(local_size_x=128) in;
++layout(triangles, max_vertices=160, max_primitives=128) out;
++layout(location=0) perprimitiveEXT flat out vec4 pcol[];
++struct P { uint base; }; taskPayloadSharedEXT P pl;
++shared uint count;
++
++void main(){
++ uint i=gl_LocalInvocationIndex;
++ if(i==0u) count=0u;
++ barrier();
++ SetMeshOutputsEXT(160,128);
++ for(uint v=i; v<160u; v+=128u) gl_MeshVerticesEXT[v].gl_Position=vec4(float(v%16u)/8.0-1.0,float(v/16u)/10.0-1.0,0.5,1);
++ for(uint p=i; p<128u; p+=128u) {
++   uint slot=min(atomicAdd(count,1u),127u);
++   gl_PrimitiveTriangleIndicesEXT[slot]=uvec3(p%160u,(p+1u)%160u,(p+2u)%160u);
++   pcol[slot]=vec4(float(p)/255.0,0,1,1);
++ }
++}
+diff --git a/tests/bc250-mesh/split-admission/dedup_task128.mesh b/tests/bc250-mesh/split-admission/dedup_task128.mesh
+new file mode 100644
+index 0000000..5a3991e
+--- /dev/null
++++ b/tests/bc250-mesh/split-admission/dedup_task128.mesh
+@@ -0,0 +1,27 @@
++#version 460
++#extension GL_EXT_mesh_shader : require
++// As dedup_task64 with V=160 P=128 (two pieces): the atomics only reach the
++// vertex index values, so every piece slices the same primitives.
++layout(local_size_x=128) in;
++layout(triangles, max_vertices=160, max_primitives=128) out;
++layout(location=0) perprimitiveEXT flat out vec4 pcol[];
++struct P { uint base; }; taskPayloadSharedEXT P pl;
++shared uint header[4];
++shared uint table[160];
++
++void main(){
++ uint i=gl_LocalInvocationIndex;
++ if(i==0u) header[0]=pl.base%129u;
++ for(uint v=i; v<160u; v+=128u) table[v]=0u;
++ barrier();
++ for(uint v=i; v<160u; v+=128u) atomicCompSwap(table[(v*7u)%160u], 0u, v+1u);
++ barrier();
++ uint np=min(header[0],128u);
++ SetMeshOutputsEXT(160,np);
++ for(uint v=i; v<160u; v+=128u) gl_MeshVerticesEXT[v].gl_Position=vec4(float(v%16u)/8.0-1.0,float(v/16u)/10.0-1.0,0.5,1);
++ for(uint p=i; p<128u; p+=128u) {
++   uint a=table[p]%160u, b=table[p+1u]%160u, c=table[p+2u]%160u;
++   gl_PrimitiveTriangleIndicesEXT[p]=uvec3(a,b,c);
++   pcol[p]=vec4(float(p)/255.0,float(pl.base),1,1);
++ }
++}
+diff --git a/tests/bc250-mesh/split-admission/dedup_task128_wide.frag b/tests/bc250-mesh/split-admission/dedup_task128_wide.frag
+new file mode 100644
+index 0000000..6b8673d
+--- /dev/null
++++ b/tests/bc250-mesh/split-admission/dedup_task128_wide.frag
+@@ -0,0 +1,6 @@
++#version 460
++#extension GL_EXT_mesh_shader : require
++layout(location=0) perprimitiveEXT flat in vec4 pcol;
++layout(location=1) in vec4 attr[10];
++layout(location=0) out vec4 o;
++void main(){ vec4 s=pcol; for(int k=0;k<10;k++) s+=attr[k]; o=s; }
+diff --git a/tests/bc250-mesh/split-admission/dedup_task128_wide.mesh b/tests/bc250-mesh/split-admission/dedup_task128_wide.mesh
+new file mode 100644
+index 0000000..c08b307
+--- /dev/null
++++ b/tests/bc250-mesh/split-admission/dedup_task128_wide.mesh
+@@ -0,0 +1,31 @@
++#version 460
++#extension GL_EXT_mesh_shader : require
++// With 13 KB of shared memory and 10 vertex outputs, V=160 P=128 (two pieces): the atomics only reach the
++// vertex index values, so every piece slices the same primitives.
++layout(local_size_x=128) in;
++layout(triangles, max_vertices=160, max_primitives=128) out;
++layout(location=0) perprimitiveEXT flat out vec4 pcol[];
++layout(location=1) out vec4 attr[][10];
++struct P { uint base; }; taskPayloadSharedEXT P pl;
++shared uint header[4];
++shared uint table[160];
++shared uint scratch[3120]; // about 13 KB of application shared memory, as in the report
++
++void main(){
++ uint i=gl_LocalInvocationIndex;
++ if(i==0u) header[0]=pl.base%129u;
++ for(uint v=i; v<160u; v+=128u) table[v]=0u;
++ barrier();
++ for(uint v=i; v<160u; v+=128u) atomicCompSwap(table[(v*7u)%160u], 0u, v+1u);
++ barrier();
++ uint np=min(header[0],128u);
++ SetMeshOutputsEXT(160,np);
++ for(uint v=i; v<3120u; v+=128u) scratch[v]=v;
++ for(uint v=i; v<160u; v+=128u) for(uint k=0u; k<10u; k++) attr[v][k]=vec4(float(v),float(k),float(table[v]),float(scratch[v*7u]));
++ for(uint v=i; v<160u; v+=128u) gl_MeshVerticesEXT[v].gl_Position=vec4(float(v%16u)/8.0-1.0,float(v/16u)/10.0-1.0,0.5,1);
++ for(uint p=i; p<128u; p+=128u) {
++   uint a=table[p]%160u, b=table[p+1u]%160u, c=table[p+2u]%160u;
++   gl_PrimitiveTriangleIndicesEXT[p]=uvec3(a,b,c);
++   pcol[p]=vec4(float(p)/255.0,float(pl.base),1,1);
++ }
++}
+diff --git a/tests/bc250-mesh/split-admission/dedup_task128_wide_np.frag b/tests/bc250-mesh/split-admission/dedup_task128_wide_np.frag
+new file mode 100644
+index 0000000..f527300
+--- /dev/null
++++ b/tests/bc250-mesh/split-admission/dedup_task128_wide_np.frag
+@@ -0,0 +1,6 @@
++#version 460
++#extension GL_EXT_mesh_shader : require
++
++layout(location=1) in vec4 attr[10];
++layout(location=0) out vec4 o;
++void main(){ vec4 s=vec4(0); for(int k=0;k<10;k++) s+=attr[k]; o=s; }
+diff --git a/tests/bc250-mesh/split-admission/dedup_task128_wide_np.mesh b/tests/bc250-mesh/split-admission/dedup_task128_wide_np.mesh
+new file mode 100644
+index 0000000..a920940
+--- /dev/null
++++ b/tests/bc250-mesh/split-admission/dedup_task128_wide_np.mesh
+@@ -0,0 +1,31 @@
++#version 460
++#extension GL_EXT_mesh_shader : require
++// With 13 KB of shared memory and 10 vertex outputs, V=160 P=128 (two pieces): the atomics only reach the
++// vertex index values, so every piece slices the same primitives.
++layout(local_size_x=128) in;
++layout(triangles, max_vertices=160, max_primitives=128) out;
++
++layout(location=1) out vec4 attr[][10];
++struct P { uint base; }; taskPayloadSharedEXT P pl;
++shared uint header[4];
++shared uint table[160];
++shared uint scratch[3120]; // about 13 KB of application shared memory, as in the report
++
++void main(){
++ uint i=gl_LocalInvocationIndex;
++ if(i==0u) header[0]=pl.base%129u;
++ for(uint v=i; v<160u; v+=128u) table[v]=0u;
++ barrier();
++ for(uint v=i; v<160u; v+=128u) atomicCompSwap(table[(v*7u)%160u], 0u, v+1u);
++ barrier();
++ uint np=min(header[0],128u);
++ SetMeshOutputsEXT(160,np);
++ for(uint v=i; v<3120u; v+=128u) scratch[v]=v;
++ for(uint v=i; v<160u; v+=128u) for(uint k=0u; k<10u; k++) attr[v][k]=vec4(float(v),float(k),float(table[v]),float(scratch[v*7u]));
++ for(uint v=i; v<160u; v+=128u) gl_MeshVerticesEXT[v].gl_Position=vec4(float(v%16u)/8.0-1.0,float(v/16u)/10.0-1.0,0.5,1);
++ for(uint p=i; p<128u; p+=128u) {
++   uint a=table[p]%160u, b=table[p+1u]%160u, c=table[p+2u]%160u;
++   gl_PrimitiveTriangleIndicesEXT[p]=uvec3(a,b,c);
++
++ }
++}
+diff --git a/tests/bc250-mesh/split-admission/dedup_task64.mesh b/tests/bc250-mesh/split-admission/dedup_task64.mesh
+new file mode 100644
+index 0000000..0ea2cfe
+--- /dev/null
++++ b/tests/bc250-mesh/split-admission/dedup_task64.mesh
+@@ -0,0 +1,25 @@
++#version 460
++#extension GL_EXT_mesh_shader : require
++// Shape of the refused NX2navi pipelines: Task + Mesh, 128 lanes (several waves: the atomics survive; one-wave workgroups get them folded into scans), V=128 P=64,
++// one per-primitive output, vertex dedup through a shared atomicCompSwap table.
++// One piece at 64 primitives: the body runs once, so the atomics are safe.
++layout(local_size_x=128) in;
++layout(triangles, max_vertices=128, max_primitives=64) out;
++layout(location=0) perprimitiveEXT flat out vec4 pcol[];
++struct P { uint base; }; taskPayloadSharedEXT P pl;
++shared uint table[128];
++
++void main(){
++ uint i=gl_LocalInvocationIndex;
++ for(uint v=i; v<128u; v+=128u) table[v]=0u;
++ barrier();
++ for(uint v=i; v<128u; v+=128u) atomicCompSwap(table[(v*7u)%128u], 0u, v+1u);
++ barrier();
++ SetMeshOutputsEXT(128,64);
++ for(uint v=i; v<128u; v+=128u) gl_MeshVerticesEXT[v].gl_Position=vec4(float(v%16u)/8.0-1.0,float(v/16u)/8.0-1.0,0.5,1);
++ for(uint p=i; p<64u; p+=128u) {
++   uint a=table[p]%128u, b=table[p+1u]%128u, c=table[p+2u]%128u;
++   gl_PrimitiveTriangleIndicesEXT[p]=uvec3(a,b,c);
++   pcol[p]=vec4(float(p)/255.0,float(pl.base),1,1);
++ }
++}
+diff --git a/tests/bc250-mesh/split-admission/dedup_task64_lds.mesh b/tests/bc250-mesh/split-admission/dedup_task64_lds.mesh
+new file mode 100644
+index 0000000..675934a
+--- /dev/null
++++ b/tests/bc250-mesh/split-admission/dedup_task64_lds.mesh
+@@ -0,0 +1,27 @@
++#version 460
++#extension GL_EXT_mesh_shader : require
++// Shape of the refused NX2navi pipelines: Task + Mesh, 128 lanes (several waves: the atomics survive; one-wave workgroups get them folded into scans), V=128 P=64,
++// one per-primitive output, vertex dedup through a shared atomicCompSwap table.
++// With about 13 KB of shared memory, like the reported shapes.
++layout(local_size_x=128) in;
++layout(triangles, max_vertices=128, max_primitives=64) out;
++layout(location=0) perprimitiveEXT flat out vec4 pcol[];
++struct P { uint base; }; taskPayloadSharedEXT P pl;
++shared uint table[128];
++shared uint scratch[3120]; // about 13 KB of application shared memory, as in the report
++
++void main(){
++ uint i=gl_LocalInvocationIndex;
++ for(uint v=i; v<128u; v+=128u) table[v]=0u;
++ for(uint v=i; v<3120u; v+=128u) scratch[v]=v;
++ barrier();
++ for(uint v=i; v<128u; v+=128u) atomicCompSwap(table[(v*7u)%128u], 0u, v+1u);
++ barrier();
++ SetMeshOutputsEXT(128,64);
++ for(uint v=i; v<128u; v+=128u) gl_MeshVerticesEXT[v].gl_Position=vec4(float(v%16u)/8.0-1.0,float(v/16u)/8.0-1.0,0.5,1);
++ for(uint p=i; p<64u; p+=128u) {
++   uint a=table[p]%128u, b=table[p+1u]%128u, c=table[p+2u]%128u;
++   gl_PrimitiveTriangleIndicesEXT[p]=uvec3(a,b,c);
++   pcol[p]=vec4(float(p)/255.0,float(pl.base),float(scratch[p*7u]),1);
++ }
++}
+diff --git a/tests/bc250-mesh/split-admission/dedup_task64_wide.frag b/tests/bc250-mesh/split-admission/dedup_task64_wide.frag
+new file mode 100644
+index 0000000..6b8673d
+--- /dev/null
++++ b/tests/bc250-mesh/split-admission/dedup_task64_wide.frag
+@@ -0,0 +1,6 @@
++#version 460
++#extension GL_EXT_mesh_shader : require
++layout(location=0) perprimitiveEXT flat in vec4 pcol;
++layout(location=1) in vec4 attr[10];
++layout(location=0) out vec4 o;
++void main(){ vec4 s=pcol; for(int k=0;k<10;k++) s+=attr[k]; o=s; }
+diff --git a/tests/bc250-mesh/split-admission/dedup_task64_wide.mesh b/tests/bc250-mesh/split-admission/dedup_task64_wide.mesh
+new file mode 100644
+index 0000000..5f528b1
+--- /dev/null
++++ b/tests/bc250-mesh/split-admission/dedup_task64_wide.mesh
+@@ -0,0 +1,29 @@
++#version 460
++#extension GL_EXT_mesh_shader : require
++// Shape of the refused NX2navi pipelines: Task + Mesh, 128 lanes (several waves: the atomics survive; one-wave workgroups get them folded into scans), V=128 P=64,
++// one per-primitive output, vertex dedup through a shared atomicCompSwap table.
++// With about 13 KB of shared memory and 10 vertex outputs, like the reported shapes.
++layout(local_size_x=128) in;
++layout(triangles, max_vertices=128, max_primitives=64) out;
++layout(location=0) perprimitiveEXT flat out vec4 pcol[];
++layout(location=1) out vec4 attr[][10];
++struct P { uint base; }; taskPayloadSharedEXT P pl;
++shared uint table[128];
++shared uint scratch[3120]; // about 13 KB of application shared memory, as in the report
++
++void main(){
++ uint i=gl_LocalInvocationIndex;
++ for(uint v=i; v<128u; v+=128u) table[v]=0u;
++ for(uint v=i; v<3120u; v+=128u) scratch[v]=v;
++ barrier();
++ for(uint v=i; v<128u; v+=128u) atomicCompSwap(table[(v*7u)%128u], 0u, v+1u);
++ barrier();
++ SetMeshOutputsEXT(128,64);
++ for(uint v=i; v<128u; v+=128u) for(uint k=0u; k<10u; k++) attr[v][k]=vec4(float(v),float(k),float(table[v]),1);
++ for(uint v=i; v<128u; v+=128u) gl_MeshVerticesEXT[v].gl_Position=vec4(float(v%16u)/8.0-1.0,float(v/16u)/8.0-1.0,0.5,1);
++ for(uint p=i; p<64u; p+=128u) {
++   uint a=table[p]%128u, b=table[p+1u]%128u, c=table[p+2u]%128u;
++   gl_PrimitiveTriangleIndicesEXT[p]=uvec3(a,b,c);
++   pcol[p]=vec4(float(p)/255.0,float(pl.base),float(scratch[p*7u]),1);
++ }
++}
+diff --git a/tests/bc250-mesh/split-admission/dedup_task64_wide_np.frag b/tests/bc250-mesh/split-admission/dedup_task64_wide_np.frag
+new file mode 100644
+index 0000000..f527300
+--- /dev/null
++++ b/tests/bc250-mesh/split-admission/dedup_task64_wide_np.frag
+@@ -0,0 +1,6 @@
++#version 460
++#extension GL_EXT_mesh_shader : require
++
++layout(location=1) in vec4 attr[10];
++layout(location=0) out vec4 o;
++void main(){ vec4 s=vec4(0); for(int k=0;k<10;k++) s+=attr[k]; o=s; }
+diff --git a/tests/bc250-mesh/split-admission/dedup_task64_wide_np.mesh b/tests/bc250-mesh/split-admission/dedup_task64_wide_np.mesh
+new file mode 100644
+index 0000000..52943c0
+--- /dev/null
++++ b/tests/bc250-mesh/split-admission/dedup_task64_wide_np.mesh
+@@ -0,0 +1,29 @@
++#version 460
++#extension GL_EXT_mesh_shader : require
++// Shape of the refused NX2navi pipelines: Task + Mesh, 128 lanes (several waves: the atomics survive; one-wave workgroups get them folded into scans), V=128 P=64,
++// one per-primitive output, vertex dedup through a shared atomicCompSwap table.
++// With about 13 KB of shared memory and 10 vertex outputs, like the reported shapes; no per-primitive attributes (only indices, as reported).
++layout(local_size_x=128) in;
++layout(triangles, max_vertices=128, max_primitives=64) out;
++
++layout(location=1) out vec4 attr[][10];
++struct P { uint base; }; taskPayloadSharedEXT P pl;
++shared uint table[128];
++shared uint scratch[3120]; // about 13 KB of application shared memory, as in the report
++
++void main(){
++ uint i=gl_LocalInvocationIndex;
++ for(uint v=i; v<128u; v+=128u) table[v]=0u;
++ for(uint v=i; v<3120u; v+=128u) scratch[v]=v;
++ barrier();
++ for(uint v=i; v<128u; v+=128u) atomicCompSwap(table[(v*7u)%128u], 0u, v+1u);
++ barrier();
++ SetMeshOutputsEXT(128,64);
++ for(uint v=i; v<128u; v+=128u) for(uint k=0u; k<10u; k++) attr[v][k]=vec4(float(v),float(k),float(table[v]),1);
++ for(uint v=i; v<128u; v+=128u) gl_MeshVerticesEXT[v].gl_Position=vec4(float(v%16u)/8.0-1.0,float(v/16u)/8.0-1.0,0.5,1);
++ for(uint p=i; p<64u; p+=128u) {
++   uint a=table[p]%128u, b=table[p+1u]%128u, c=table[p+2u]%128u;
++   gl_PrimitiveTriangleIndicesEXT[p]=uvec3(a,b,c);
++
++ }
++}
+diff --git a/tests/bc250-mesh/split-admission/early_scratch_end_task128.frag b/tests/bc250-mesh/split-admission/early_scratch_end_task128.frag
+new file mode 100644
+index 0000000..2b6bc19
+--- /dev/null
++++ b/tests/bc250-mesh/split-admission/early_scratch_end_task128.frag
+@@ -0,0 +1,4 @@
++#version 460
++layout(location=0) in vec4 attr[8];
++layout(location=0) out vec4 o;
++void main(){ vec4 s=vec4(0); for(int k=0;k<8;k++) s+=attr[k]; o=s; }
+diff --git a/tests/bc250-mesh/split-admission/early_scratch_end_task128.mesh b/tests/bc250-mesh/split-admission/early_scratch_end_task128.mesh
+new file mode 100644
+index 0000000..64d1a6d
+--- /dev/null
++++ b/tests/bc250-mesh/split-admission/early_scratch_end_task128.mesh
+@@ -0,0 +1,30 @@
++#version 460
++#extension GL_EXT_mesh_shader : require
++// V=160 P=128 Task + Mesh with 8 vertex outputs and about 15 KB of scratch that the
++// shader only uses before it writes outputs (values carried in registers). Over the
++// expansion's 28 KiB staging budget, but the staging arrays fit over the dead scratch.
++// The dedup table is read while writing indices, so its bytes stay reserved; it is
++// declared first, so the dead scratch ends the application region.
++layout(local_size_x=128) in;
++layout(triangles, max_vertices=160, max_primitives=128) out;
++layout(location=0) out vec4 attr[][8];
++struct P { uint base; }; taskPayloadSharedEXT P pl;
++shared uint table[160];
++shared uint scratch[3840];
++
++void main(){
++ uint i=gl_LocalInvocationIndex;
++ for(uint v=i; v<3840u; v+=128u) scratch[v]=v*3u+pl.base;
++ for(uint v=i; v<160u; v+=128u) table[v]=0u;
++ barrier();
++ for(uint v=i; v<160u; v+=128u) atomicCompSwap(table[(v*7u)%160u], 0u, v+1u);
++ uint a0=scratch[(i*7u)%3840u], a1=scratch[(i*13u+5u)%3840u];
++ barrier();
++ SetMeshOutputsEXT(160,128);
++ for(uint v=i; v<160u; v+=128u) {
++   gl_MeshVerticesEXT[v].gl_Position=vec4(float(v%16u)/8.0-1.0,float(v/16u)/10.0-1.0,0.5,1);
++   for(uint k=0u; k<8u; k++) attr[v][k]=vec4(float(v),float(k),float(a0),float(a1));
++ }
++ for(uint p=i; p<128u; p+=128u)
++   gl_PrimitiveTriangleIndicesEXT[p]=uvec3(table[p]%160u,table[p+1u]%160u,table[p+2u]%160u);
++}
+diff --git a/tests/bc250-mesh/split-admission/early_scratch_task128.frag b/tests/bc250-mesh/split-admission/early_scratch_task128.frag
+new file mode 100644
+index 0000000..2b6bc19
+--- /dev/null
++++ b/tests/bc250-mesh/split-admission/early_scratch_task128.frag
+@@ -0,0 +1,4 @@
++#version 460
++layout(location=0) in vec4 attr[8];
++layout(location=0) out vec4 o;
++void main(){ vec4 s=vec4(0); for(int k=0;k<8;k++) s+=attr[k]; o=s; }
+diff --git a/tests/bc250-mesh/split-admission/early_scratch_task128.mesh b/tests/bc250-mesh/split-admission/early_scratch_task128.mesh
+new file mode 100644
+index 0000000..e622ca8
+--- /dev/null
++++ b/tests/bc250-mesh/split-admission/early_scratch_task128.mesh
+@@ -0,0 +1,29 @@
++#version 460
++#extension GL_EXT_mesh_shader : require
++// V=160 P=128 Task + Mesh with 8 vertex outputs and about 15 KB of scratch that the
++// shader only uses before it writes outputs (values carried in registers). Over the
++// expansion's 28 KiB staging budget, but the staging arrays fit over the dead scratch.
++// The dedup table is read while writing indices, so its bytes stay reserved.
++layout(local_size_x=128) in;
++layout(triangles, max_vertices=160, max_primitives=128) out;
++layout(location=0) out vec4 attr[][8];
++struct P { uint base; }; taskPayloadSharedEXT P pl;
++shared uint table[160];
++shared uint scratch[3840];
++
++void main(){
++ uint i=gl_LocalInvocationIndex;
++ for(uint v=i; v<3840u; v+=128u) scratch[v]=v*3u+pl.base;
++ for(uint v=i; v<160u; v+=128u) table[v]=0u;
++ barrier();
++ for(uint v=i; v<160u; v+=128u) atomicCompSwap(table[(v*7u)%160u], 0u, v+1u);
++ uint a0=scratch[(i*7u)%3840u], a1=scratch[(i*13u+5u)%3840u];
++ barrier();
++ SetMeshOutputsEXT(160,128);
++ for(uint v=i; v<160u; v+=128u) {
++   gl_MeshVerticesEXT[v].gl_Position=vec4(float(v%16u)/8.0-1.0,float(v/16u)/10.0-1.0,0.5,1);
++   for(uint k=0u; k<8u; k++) attr[v][k]=vec4(float(v),float(k),float(a0),float(a1));
++ }
++ for(uint p=i; p<128u; p+=128u)
++   gl_PrimitiveTriangleIndicesEXT[p]=uvec3(table[p]%160u,table[p+1u]%160u,table[p+2u]%160u);
++}
 diff --git a/tests/bc250-mesh/split-admission/explicit_layout128.mesh b/tests/bc250-mesh/split-admission/explicit_layout128.mesh
 new file mode 100644
 index 0000000..6610431
@@ -29182,12 +29684,194 @@ index 0000000..0f883ef
 +layout(location=0) perprimitiveEXT flat in vec4 pcol;
 +layout(location=0) out vec4 o;
 +void main(){ o=pcol; }
+diff --git a/tests/bc250-mesh/split-admission/feat_2d_task.mesh b/tests/bc250-mesh/split-admission/feat_2d_task.mesh
+new file mode 100644
+index 0000000..95e7e88
+--- /dev/null
++++ b/tests/bc250-mesh/split-admission/feat_2d_task.mesh
+@@ -0,0 +1,13 @@
++#version 460
++#extension GL_EXT_mesh_shader : require
++// Task index route feature: a 2D Mesh workgroup (32x4).
++layout(local_size_x=32, local_size_y=4) in;
++layout(triangles, max_vertices=128, max_primitives=64) out;
++layout(location=0) perprimitiveEXT flat out vec4 pcol[];
++struct P { uint base; }; taskPayloadSharedEXT P pl;
++void main(){
++ uint i=gl_LocalInvocationIndex;
++ SetMeshOutputsEXT(128,64);
++ gl_MeshVerticesEXT[i].gl_Position=vec4(float(gl_LocalInvocationID.x)/16.0-1.0,float(gl_LocalInvocationID.y)/2.0-1.0,0.5,1);
++ if(i<64u){ gl_PrimitiveTriangleIndicesEXT[i]=uvec3(i,(i+1u)%128u,(i+2u)%128u); pcol[i]=vec4(float(pl.base),0,1,1); }
++}
+diff --git a/tests/bc250-mesh/split-admission/feat_bary_task.frag b/tests/bc250-mesh/split-admission/feat_bary_task.frag
+new file mode 100644
+index 0000000..3ceca6c
+--- /dev/null
++++ b/tests/bc250-mesh/split-admission/feat_bary_task.frag
+@@ -0,0 +1,4 @@
++#version 460
++#extension GL_EXT_fragment_shader_barycentric : require
++layout(location=0) out vec4 o;
++void main(){ o=vec4(gl_BaryCoordEXT, 1); }
+diff --git a/tests/bc250-mesh/split-admission/feat_bary_task.mesh b/tests/bc250-mesh/split-admission/feat_bary_task.mesh
+new file mode 100644
+index 0000000..ac787da
+--- /dev/null
++++ b/tests/bc250-mesh/split-admission/feat_bary_task.mesh
+@@ -0,0 +1,12 @@
++#version 460
++#extension GL_EXT_mesh_shader : require
++// Task index route feature: the fragment shader reads barycentrics (gl_BaryCoordEXT).
++layout(local_size_x=128) in;
++layout(triangles, max_vertices=128, max_primitives=64) out;
++struct P { uint base; }; taskPayloadSharedEXT P pl;
++void main(){
++ uint i=gl_LocalInvocationIndex;
++ SetMeshOutputsEXT(128,64);
++ gl_MeshVerticesEXT[i].gl_Position=vec4(float(i%16u)/8.0-1.0,float(i/16u)/8.0-1.0+float(pl.base)*0.0,0.5,1);
++ if(i<64u) gl_PrimitiveTriangleIndicesEXT[i]=uvec3(i,(i+1u)%128u,(i+2u)%128u);
++}
+diff --git a/tests/bc250-mesh/split-admission/feat_cull_task.mesh b/tests/bc250-mesh/split-admission/feat_cull_task.mesh
+new file mode 100644
+index 0000000..690337f
+--- /dev/null
++++ b/tests/bc250-mesh/split-admission/feat_cull_task.mesh
+@@ -0,0 +1,17 @@
++#version 460
++#extension GL_EXT_mesh_shader : require
++// Task index route feature: gl_CullPrimitiveEXT (culled primitives become degenerate).
++layout(local_size_x=128) in;
++layout(triangles, max_vertices=128, max_primitives=64) out;
++layout(location=0) perprimitiveEXT flat out vec4 pcol[];
++struct P { uint base; }; taskPayloadSharedEXT P pl;
++void main(){
++ uint i=gl_LocalInvocationIndex;
++ SetMeshOutputsEXT(128,64);
++ gl_MeshVerticesEXT[i].gl_Position=vec4(float(i%16u)/8.0-1.0,float(i/16u)/8.0-1.0,0.5,1);
++ if(i<64u){
++   gl_PrimitiveTriangleIndicesEXT[i]=uvec3(i,(i+1u)%128u,(i+2u)%128u);
++   gl_MeshPrimitivesEXT[i].gl_CullPrimitiveEXT=(i&1u)==1u;
++   pcol[i]=vec4(float(pl.base),0,1,1);
++ }
++}
+diff --git a/tests/bc250-mesh/split-admission/feat_layer_task.mesh b/tests/bc250-mesh/split-admission/feat_layer_task.mesh
+new file mode 100644
+index 0000000..dc65c7a
+--- /dev/null
++++ b/tests/bc250-mesh/split-admission/feat_layer_task.mesh
+@@ -0,0 +1,17 @@
++#version 460
++#extension GL_EXT_mesh_shader : require
++// Task index route feature: per-primitive gl_Layer and gl_ViewportIndex (single layer / viewport 0 here).
++layout(local_size_x=128) in;
++layout(triangles, max_vertices=128, max_primitives=64) out;
++layout(location=0) perprimitiveEXT flat out vec4 pcol[];
++struct P { uint base; }; taskPayloadSharedEXT P pl;
++void main(){
++ uint i=gl_LocalInvocationIndex;
++ SetMeshOutputsEXT(128,64);
++ gl_MeshVerticesEXT[i].gl_Position=vec4(float(i%16u)/8.0-1.0,float(i/16u)/8.0-1.0,0.5,1);
++ if(i<64u){
++   gl_PrimitiveTriangleIndicesEXT[i]=uvec3(i,(i+1u)%128u,(i+2u)%128u);
++   gl_MeshPrimitivesEXT[i].gl_Layer=0; gl_MeshPrimitivesEXT[i].gl_ViewportIndex=0;
++   pcol[i]=vec4(float(pl.base),0,1,1);
++ }
++}
+diff --git a/tests/bc250-mesh/split-admission/feat_numwg_task.mesh b/tests/bc250-mesh/split-admission/feat_numwg_task.mesh
+new file mode 100644
+index 0000000..0d6577d
+--- /dev/null
++++ b/tests/bc250-mesh/split-admission/feat_numwg_task.mesh
+@@ -0,0 +1,13 @@
++#version 460
++#extension GL_EXT_mesh_shader : require
++// Task index route feature: gl_NumWorkGroups (the record's Mesh grid).
++layout(local_size_x=128) in;
++layout(triangles, max_vertices=128, max_primitives=64) out;
++layout(location=0) perprimitiveEXT flat out vec4 pcol[];
++struct P { uint base; }; taskPayloadSharedEXT P pl;
++void main(){
++ uint i=gl_LocalInvocationIndex;
++ SetMeshOutputsEXT(128,64);
++ gl_MeshVerticesEXT[i].gl_Position=vec4(float(i%16u)/8.0-1.0,float(i/16u)/8.0-1.0,0.5,1);
++ if(i<64u){ gl_PrimitiveTriangleIndicesEXT[i]=uvec3(i,(i+1u)%128u,(i+2u)%128u); pcol[i]=vec4(float(gl_NumWorkGroups.x),float(pl.base),1,1); }
++}
+diff --git a/tests/bc250-mesh/split-admission/feat_primid_task.frag b/tests/bc250-mesh/split-admission/feat_primid_task.frag
+new file mode 100644
+index 0000000..dc54fd3
+--- /dev/null
++++ b/tests/bc250-mesh/split-admission/feat_primid_task.frag
+@@ -0,0 +1,3 @@
++#version 460
++layout(location=0) out vec4 o;
++void main(){ o=vec4(float(gl_PrimitiveID & 255)/255.0, float((gl_PrimitiveID>>8) & 255)/255.0, 0, 1); }
+diff --git a/tests/bc250-mesh/split-admission/feat_primid_task.mesh b/tests/bc250-mesh/split-admission/feat_primid_task.mesh
+new file mode 100644
+index 0000000..bb94705
+--- /dev/null
++++ b/tests/bc250-mesh/split-admission/feat_primid_task.mesh
+@@ -0,0 +1,12 @@
++#version 460
++#extension GL_EXT_mesh_shader : require
++// Task index route feature: the fragment shader reads gl_PrimitiveID written by the Mesh shader.
++layout(local_size_x=128) in;
++layout(triangles, max_vertices=128, max_primitives=64) out;
++struct P { uint base; }; taskPayloadSharedEXT P pl;
++void main(){
++ uint i=gl_LocalInvocationIndex;
++ SetMeshOutputsEXT(128,64);
++ gl_MeshVerticesEXT[i].gl_Position=vec4(float(i%16u)/8.0-1.0,float(i/16u)/8.0-1.0,0.5,1);
++ if(i<64u){ gl_PrimitiveTriangleIndicesEXT[i]=uvec3(i,(i+1u)%128u,(i+2u)%128u); gl_MeshPrimitivesEXT[i].gl_PrimitiveID=int(i*3u+pl.base); }
++}
+diff --git a/tests/bc250-mesh/split-admission/feat_ssbo_task.mesh b/tests/bc250-mesh/split-admission/feat_ssbo_task.mesh
+new file mode 100644
+index 0000000..db3b4cd
+--- /dev/null
++++ b/tests/bc250-mesh/split-admission/feat_ssbo_task.mesh
+@@ -0,0 +1,16 @@
++#version 460
++#extension GL_EXT_mesh_shader : require
++// Task index route feature: the Mesh shader writes a storage buffer (runs once per workgroup, as on hardware).
++layout(local_size_x=128) in;
++layout(triangles, max_vertices=128, max_primitives=64) out;
++layout(location=0) perprimitiveEXT flat out vec4 pcol[];
++layout(set=0,binding=0,std430) buffer S { uint count; uint data[]; } s;
++struct P { uint base; }; taskPayloadSharedEXT P pl;
++void main(){
++ uint i=gl_LocalInvocationIndex;
++ SetMeshOutputsEXT(128,64);
++ s.data[(gl_WorkGroupID.x*128u+i)&1023u]=i+pl.base;
++ if(i==0u) atomicAdd(s.count,1u);
++ gl_MeshVerticesEXT[i].gl_Position=vec4(float(i%16u)/8.0-1.0,float(i/16u)/8.0-1.0,0.5,1);
++ if(i<64u){ gl_PrimitiveTriangleIndicesEXT[i]=uvec3(i,(i+1u)%128u,(i+2u)%128u); pcol[i]=vec4(1,0,1,1); }
++}
+diff --git a/tests/bc250-mesh/split-admission/feat_view_task.mesh b/tests/bc250-mesh/split-admission/feat_view_task.mesh
+new file mode 100644
+index 0000000..dc6e47d
+--- /dev/null
++++ b/tests/bc250-mesh/split-admission/feat_view_task.mesh
+@@ -0,0 +1,15 @@
++#version 460
++#extension GL_EXT_mesh_shader : require
++#extension GL_EXT_multiview : require
++// Task index route feature: multiview, the Mesh shader reads gl_ViewIndex (one pass chain per view).
++layout(local_size_x=128) in;
++layout(triangles, max_vertices=128, max_primitives=64) out;
++layout(location=0) perprimitiveEXT flat out vec4 pcol[];
++struct P { uint base; }; taskPayloadSharedEXT P pl;
++void main(){
++ uint i=gl_LocalInvocationIndex;
++ SetMeshOutputsEXT(128,64);
++ float shift=float(gl_ViewIndex)*0.25;
++ gl_MeshVerticesEXT[i].gl_Position=vec4(float(i%16u)/8.0-1.0+shift,float(i/16u)/8.0-1.0,0.5,1);
++ if(i<64u){ gl_PrimitiveTriangleIndicesEXT[i]=uvec3(i,(i+1u)%128u,(i+2u)%128u); pcol[i]=vec4(float(gl_ViewIndex),float(pl.base),1,1); }
++}
 diff --git a/tests/bc250-mesh/split-admission/mkpipe.c b/tests/bc250-mesh/split-admission/mkpipe.c
 new file mode 100644
-index 0000000..1fa00ca
+index 0000000..493272d
 --- /dev/null
 +++ b/tests/bc250-mesh/split-admission/mkpipe.c
-@@ -0,0 +1,33 @@
+@@ -0,0 +1,36 @@
 +/* create one graphics pipeline from mesh.spv [+task.spv] + frag.spv; print VkResult. */
 +#include <vulkan/vulkan.h>
 +#include <stdio.h>
@@ -29209,7 +29893,10 @@ index 0000000..1fa00ca
 + const char*ext="VK_EXT_mesh_shader";
 + VkDeviceCreateInfo dci={VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO,&f13,0,1,&q,0,0,1,&ext,&feat};
 + VkResult r=vkCreateDevice(pd,&dci,0,&dev);if(r){printf("DEVICE %d\n",r);return 2;}
-+ VkPipelineLayoutCreateInfo plci={VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};VkPipelineLayout lay;vkCreatePipelineLayout(dev,&plci,0,&lay);
++ /* One storage buffer at set 0 binding 0 for the fixtures that write one (unused by the others). */
++ VkDescriptorSetLayoutBinding sb={0,VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,1,VK_SHADER_STAGE_TASK_BIT_EXT|VK_SHADER_STAGE_MESH_BIT_EXT|VK_SHADER_STAGE_FRAGMENT_BIT,0};
++ VkDescriptorSetLayoutCreateInfo slci={VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO,0,0,1,&sb};VkDescriptorSetLayout sl;vkCreateDescriptorSetLayout(dev,&slci,0,&sl);
++ VkPipelineLayoutCreateInfo plci={VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO,0,0,1,&sl};VkPipelineLayout lay;vkCreatePipelineLayout(dev,&plci,0,&lay);
 + VkPipelineShaderStageCreateInfo st[3]={{VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,0,0,VK_SHADER_STAGE_MESH_BIT_EXT,sm(mesh),"main"},
 +  {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,0,0,VK_SHADER_STAGE_FRAGMENT_BIT,sm(frag),"main"}};
 + if(task)st[2]=(VkPipelineShaderStageCreateInfo){VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,0,0,VK_SHADER_STAGE_TASK_BIT_EXT,sm(task),"main"};
@@ -29355,10 +30042,10 @@ index 0000000..611c5d0
 + return r?1:0;}
 diff --git a/tests/bc250-mesh/split-admission/run.sh b/tests/bc250-mesh/split-admission/run.sh
 new file mode 100755
-index 0000000..e1b9aab
+index 0000000..1c51889
 --- /dev/null
 +++ b/tests/bc250-mesh/split-admission/run.sh
-@@ -0,0 +1,85 @@
+@@ -0,0 +1,119 @@
 +#!/usr/bin/env bash
 +# Split admission regression (drm-shim only, never the real GPU).
 +#
@@ -29398,18 +30085,22 @@ index 0000000..e1b9aab
 +  glslangValidator -S mesh --target-env vulkan1.3 -o "$work/$(basename "$s" .mesh).spv" "$s" >/dev/null || exit 2
 +done
 +glslangValidator -S task --target-env vulkan1.3 -o "$work/t.spv" "$here/t.task" >/dev/null || exit 2
-+glslangValidator -S frag --target-env vulkan1.3 -o "$work/f.spv" "$here/f.frag" >/dev/null || exit 2
++for s in "$here"/*.frag; do
++  glslangValidator -S frag --target-env vulkan1.3 -o "$work/$(basename "$s" .frag).frag.spv" "$s" >/dev/null || exit 2
++done
 +
 +fail=0
 +# name | mesh | task (- for none) | extra env | expected result | expected message (grep -F, or -)
 +while IFS='|' read -r name mesh task extra want msg; do
 +  [ -z "$name" ] && continue
 +  case "$name" in \#*) continue;; esac
++  # A mesh fixture with its own <mesh>.frag is paired with it; the others use f.frag.
++  frag=f.frag.spv; [ -f "$here/$mesh.frag" ] && frag="$mesh.frag.spv"
 +  if [ "$task" = - ]; then
-+    out=$(cd "$work" && shim env $extra ./pipe "$mesh.spv" f.spv 2>&1)
++    out=$(cd "$work" && shim env $extra ./pipe "$mesh.spv" "$frag" 2>&1)
 +    got=$(printf '%s\n' "$out" | sed -n 's/^PIPELINE_RESULT=//p' | tail -1)
 +  else
-+    out=$(cd "$work" && shim env $extra ./mkpipe "$mesh.spv" f.spv "$task.spv" 3 2>&1)
++    out=$(cd "$work" && shim env $extra ./mkpipe "$mesh.spv" "$frag" "$task.spv" 3 2>&1)
 +    got=$(printf '%s\n' "$out" | sed -n 's/^RESULT //p' | tail -1)
 +  fi
 +  why=$(printf '%s\n' "$out" | grep -o 'split rejected: .*' | head -1)
@@ -29441,7 +30132,37 @@ index 0000000..e1b9aab
 +tri256_barrier|tri256_barrier|-||-8|split rejected: store_ssbo
 +tri128_numwg|tri128_numwg|-||-8|split rejected: store_ssbo
 +tri128_atomic|tri128_atomic|-||0|external atomics: 1 guarded to the first piece
-+tri128_shatomic|tri128_shatomic|-||-8|split rejected: shared_atomic
++# shared atomics whose result nothing reads: admitted (no taint reaches the primitives)
++tri128_shatomic|tri128_shatomic|-||0|split shared atomics admitted: pieces=2
++# shared atomics behind Task (the shape of the refused NX2navi pipelines)
++dedup_task64|dedup_task64|t||0|MESH SAFE OWNED
++dedup_task128|dedup_task128|t||0|split shared atomics admitted: pieces=2 (primitive slicing proven independent)
++dedup_task64_wide|dedup_task64_wide|t|RADV_BC250_MESH_TASK_IDX=0|-8|split rejected: required vertex expansion unavailable
++dedup_task128_wide|dedup_task128_wide|t|RADV_BC250_MESH_TASK_IDX=0|-8|split rejected: required vertex expansion unavailable
++compact_task128|compact_task128|t|RADV_BC250_MESH_TASK_IDX=0|-8|split rejected: shared atomics select a per-primitive slot
++# over the 28 KiB staging budget, but the staging arrays fit over scratch that is dead before the outputs
++early_scratch_task128|early_scratch_task128|t||0|BC250 MESH STAGING ALIAS: applied
++early_scratch_end_task128|early_scratch_end_task128|t||0|BC250 MESH STAGING ALIAS: applied
++# no per-primitive attributes (as reported): V=128 P=64 fits the ordinary route, V=160 P=128 reads its scratch late
++dedup_task64_wide_np|dedup_task64_wide_np|t||0|-
++dedup_task128_wide_np|dedup_task128_wide_np|t|RADV_BC250_MESH_TASK_IDX=0|-8|split rejected: required vertex expansion unavailable
++dedup_task128_wide_np_idx|dedup_task128_wide_np|t|RADV_BC250_MESH_TASK_IDX=1|0|BC250 TASK IDX: applied
++# (the rows above turn the Task index route off: it is on by default in the DirectMesh preset)
++# RADV_BC250_MESH_TASK_IDX: the refused Task pipelines run as the Task index route (the index pass runs the
++# Mesh body once per workgroup in a compute shader: full LDS, shared atomics keep their meaning)
++dedup_task64_wide_idx|dedup_task64_wide|t|RADV_BC250_MESH_TASK_IDX=1|0|BC250 TASK IDX: applied
++dedup_task128_wide_idx|dedup_task128_wide|t|RADV_BC250_MESH_TASK_IDX=1|0|BC250 TASK IDX: applied
++# the Task index route stores outputs at the slots the shader writes: compaction is admitted
++compact_task128_idx|compact_task128|t|RADV_BC250_MESH_TASK_IDX=1|0|BC250 TASK IDX: applied
++# Task index route features (forced on shapes the Mesh route also takes)
++feat_2d_task|feat_2d_task|t|RADV_BC250_MESH_TASK_IDX=force|0|BC250 TASK IDX: applied
++feat_ssbo_task|feat_ssbo_task|t|RADV_BC250_MESH_TASK_IDX=force|0|BC250 TASK IDX: applied
++feat_cull_task|feat_cull_task|t|RADV_BC250_MESH_TASK_IDX=force|0|BC250 TASK IDX: applied
++feat_numwg_task|feat_numwg_task|t|RADV_BC250_MESH_TASK_IDX=force|0|BC250 TASK IDX: applied
++feat_view_task|feat_view_task|t|RADV_BC250_MESH_TASK_IDX=force|0|BC250 TASK IDX: applied
++feat_primid_task|feat_primid_task|t|RADV_BC250_MESH_TASK_IDX=force|0|BC250 TASK IDX: applied
++feat_layer_task|feat_layer_task|t|RADV_BC250_MESH_TASK_IDX=force|0|BC250 TASK IDX: applied
++feat_bary_task|feat_bary_task|t|RADV_BC250_MESH_TASK_IDX=force|0|BC250 TASK IDX: applied
 +EOF
 +exit $fail
 diff --git a/tests/bc250-mesh/split-admission/shared_barrier256.mesh b/tests/bc250-mesh/split-admission/shared_barrier256.mesh
@@ -32707,6 +33428,384 @@ index 0000000..fa88426
 +   printf("DONE\n");
 +   return 0;
 +}
+diff --git a/tests/bc250-mesh/task-idx/README.md b/tests/bc250-mesh/task-idx/README.md
+new file mode 100644
+index 0000000..aa1f4a3
+--- /dev/null
++++ b/tests/bc250-mesh/task-idx/README.md
+@@ -0,0 +1,69 @@
++# Task index route (`RADV_BC250_MESH_TASK_IDX`, opt-in)
++
++Some Task + Mesh pipelines have no protected Mesh route. The reported case: a Mesh stage with about 13 KB
++of application shared memory, ten vertex outputs and a shared `atomicCompSwap` table. Splitting cannot
++help: every piece stages all vertices, and application shared memory plus staged outputs exceed the
++expansion's 28 KiB NGG window at every piece count. Without the switch, pipeline creation fails closed
++and the game draws nothing for those objects.
++
++With `RADV_BC250_MESH_TASK_IDX=1`, such a pipeline is created as the Task index route instead:
++
++- **Task stage:** runs as the existing hybrid producer (`bc250_create_task_producer`). It writes one Mesh
++  launch record and one payload per Task workgroup, in chunks of 4096 workgroups.
++- **Mesh stage:** runs as the stored index pass (`radv_bc250_idx_build_task_cs`). This is a compute shader,
++  so it has the full LDS, runs the Mesh body exactly once per workgroup (shared atomics keep their
++  meaning), and never goes through the NGG Mesh lowering. Payload reads use
++  `constants.compute_args + record * stride`, and the application's DrawID stays the draw's own.
++- **Drawing:** the stored outputs are drawn by the index route's vertex/fragment pipeline. That pipeline
++  is what the application receives (`bc250_idx_gfx` points back to it).
++- **Overflow:** there is no Mesh route to fall back to. Each producer chunk runs up to N index passes, and
++  pass p draws pass p-1's overflow suffix. The setup shader already writes that suffix as ordinary records
++  plus a GPU count. Every pass drains earlier readers and restarts the pool, and two table sets per
++  command buffer alternate between passes. Pass p > 0 sits in nested `COND_EXEC` regions on a 0/1 flag
++  written by pass p-1's setup (a Task-only setup variant). When nothing overflowed, the later passes,
++  including their drains, are skipped on the GPU (about 170 dwords each in the command buffer). A skipped
++  pass skips every later one, so no pass reads a stale flag. N defaults to 16
++  (`RADV_BC250_MESH_TASK_IDX_PASSES` overrides it). Records left after N passes are not drawn.
++
++Beyond the ordinary index route, the Task index route admits these, because it always stores outputs at the
++slots the shader writes and runs each Mesh workgroup exactly once (in exactly one pass), as the hardware would:
++
++- primitive compaction (output slots chosen through shared atomics, not owned by fixed invocations);
++- 2D/3D Mesh workgroups (the pass is a compute shader with the same shape);
++- `gl_CullPrimitiveEXT` (staged in the pass's shared memory; culled primitives become degenerate);
++- `gl_NumWorkGroups` (the record's Mesh grid);
++- storage buffer and image writes and external atomics;
++- multiview: the producer runs once, then the pass chain runs once per view with that view's ViewIndex and
++  draws only that view (a Task shader reading ViewIndex is refused, as on the hybrid route);
++- fragment shaders reading `gl_PrimitiveID` (moved to a free generic slot as a flat primitive attribute),
++  `gl_Layer`/`gl_ViewportIndex` (exported by the stored vertex shader from the provoking vertex) or
++  barycentrics (the stored triangles keep the Mesh corner order).
++
++Reading back Mesh outputs is also handled, but valid SPIR-V never does it (VUID-StandaloneSpirv-MeshEXT-07107).
++
++Indirect Task draws cover the full 4,194,304 Task workgroups: Task index pipelines use larger producer
++chunks (up to 32,768 workgroups, bounded by 32 MiB of records and payloads and by the pass budget), so an
++indirect record has BC250_MAX_TASK_TOTAL / chunk slots (128 to 1024). Each slot carries its pass chain, so an
++indirect draw records about 2.6 K dwords per slot; inactive slots are skipped on the GPU.
++
++`SIMULTANEOUS_USE` command buffers work on one queue: every pass drains earlier work before it rewrites the pool
++and the table sets. Concurrent execution of one command buffer on two queues is not protected.
++
++Limits:
++
++- Device-generated commands skip these draws, with one warning. A DGC capture records each sequence into a
++  temporary recording; this route's pool and tables would belong to it and be freed while the GPU still uses them.
++- Pipeline statistics do not count the index pass as Mesh invocations.
++
++Checks (all CPU, no GPU execution):
++
++- `radv_tests`: `task_compacted_slots`, `task_cull_primitive`, `task_output_read_back` and `task_num_workgroups`
++  interpret the pass with each feature. `task_payload_*` interprets the Task-mode index pass and the fetch vertex shader and
++  checks every stored output, including the payload of the right record. `task_chain_*` runs the setup
++  shader pass after pass and checks that every record is drawn exactly once, in order, with the pool
++  restarted each pass.
++- `run.py`: creates both wide fixtures as Task index pipelines and records direct and indirect draws under
++  the noop shim with NIR/ACO validation and the Vulkan validation layer.
++- `../split-admission/run.sh`: the `*_idx` rows.
++
++Hardware: not run yet. The first GPU gate should be one of the wide fixtures through `index_gate` on BC-250.
+diff --git a/tests/bc250-mesh/task-idx/gpu_gate.py b/tests/bc250-mesh/task-idx/gpu_gate.py
+new file mode 100644
+index 0000000..508cd71
+--- /dev/null
++++ b/tests/bc250-mesh/task-idx/gpu_gate.py
+@@ -0,0 +1,176 @@
++#!/usr/bin/env python3
++"""One-shot BC-250 hardware gate for the Task index route, shared atomics in the split and staging over dead
++shared memory. Run from a kit made by make_gpu_kit.sh, on a quiet system (no game, no build).
++
++Steps run in order, lowest risk first, one GPU submission each, and the gate stops at the first failure.
++Before each submission it checks that the intended route was compiled; only then does it release the submission.
++Logs are written and synced to disk before every submission, so a hang leaves evidence. A step that started but
++never finished (a hang or freeze) blocks every later run of this kit: do not retry it, report the log instead."""
++import hashlib, json, os, select, subprocess, sys, time
++
++KIT = os.path.dirname(os.path.abspath(__file__))
++STATE = os.path.join(KIT, 'state')
++SH = lambda name: os.path.join(KIT, 'shaders', name)
++
++# name, mesh, fragment, indirect mode (None = direct), extra environment, required trace, image to match
++STEPS = [
++    ('1-split-atomics-direct', 'dedup_task128.mesh.spv', 'f.frag.spv', None, {},
++     'split shared atomics admitted: pieces=2', None),
++    ('2-staging-alias-direct', 'early_scratch_task128.mesh.spv', 'early_scratch_task128.frag.spv', None, {},
++     'MESH STAGING ALIAS: applied', None),
++    ('3-task-idx-direct', 'dedup_task128.mesh.spv', 'f.frag.spv', None, {'RADV_BC250_MESH_TASK_IDX': 'force'},
++     'BC250 TASK IDX: applied', '1-split-atomics-direct'),
++    ('4-task-idx-alias-shape', 'early_scratch_task128.mesh.spv', 'early_scratch_task128.frag.spv', None,
++     {'RADV_BC250_MESH_TASK_IDX': 'force'}, 'BC250 TASK IDX: applied', '2-staging-alias-direct'),
++    ('5-split-atomics-indirect', 'dedup_task128.mesh.spv', 'f.frag.spv', 'count', {},
++     'split shared atomics admitted: pieces=2', None),
++    ('6-task-idx-indirect', 'dedup_task128.mesh.spv', 'f.frag.spv', 'count', {'RADV_BC250_MESH_TASK_IDX': 'force'},
++     'BC250 TASK IDX: applied', '5-split-atomics-indirect'),
++    ('7-wide-task-idx-direct', 'dedup_task128_wide_np.mesh.spv', 'dedup_task128_wide_np.frag.spv', None,
++     {'RADV_BC250_MESH_TASK_IDX': '1'}, 'BC250 TASK IDX: applied', None),
++    ('8-wide-task-idx-indirect', 'dedup_task128_wide_np.mesh.spv', 'dedup_task128_wide_np.frag.spv', 'count',
++     {'RADV_BC250_MESH_TASK_IDX': '1'}, 'BC250 TASK IDX: applied', None),
++    # Task index route features against the same shader on the Mesh route ('!' = must not appear)
++    ('9-cull-mesh-route', 'feat_cull_task.mesh.spv', 'f.frag.spv', None, {}, '!BC250 TASK IDX: applied', None),
++    ('10-cull-task-idx', 'feat_cull_task.mesh.spv', 'f.frag.spv', None, {'RADV_BC250_MESH_TASK_IDX': 'force'}, 'BC250 TASK IDX: applied', '9-cull-mesh-route'),
++    ('11-2d-mesh-route', 'feat_2d_task.mesh.spv', 'f.frag.spv', None, {}, '!BC250 TASK IDX: applied', None),
++    ('12-2d-task-idx', 'feat_2d_task.mesh.spv', 'f.frag.spv', None, {'RADV_BC250_MESH_TASK_IDX': 'force'}, 'BC250 TASK IDX: applied', '11-2d-mesh-route'),
++    ('13-numwg-mesh-route', 'feat_numwg_task.mesh.spv', 'f.frag.spv', None, {}, '!BC250 TASK IDX: applied', None),
++    ('14-numwg-task-idx', 'feat_numwg_task.mesh.spv', 'f.frag.spv', None, {'RADV_BC250_MESH_TASK_IDX': 'force'}, 'BC250 TASK IDX: applied', '13-numwg-mesh-route'),
++    ('15-primid-mesh-route', 'feat_primid_task.mesh.spv', 'feat_primid_task.frag.spv', None, {}, '!BC250 TASK IDX: applied', None),
++    ('16-primid-task-idx', 'feat_primid_task.mesh.spv', 'feat_primid_task.frag.spv', None, {'RADV_BC250_MESH_TASK_IDX': 'force'}, 'BC250 TASK IDX: applied', '15-primid-mesh-route'),
++    ('17-bary-mesh-route', 'feat_bary_task.mesh.spv', 'feat_bary_task.frag.spv', None, {}, '!BC250 TASK IDX: applied', None),
++    ('18-bary-task-idx', 'feat_bary_task.mesh.spv', 'feat_bary_task.frag.spv', None, {'RADV_BC250_MESH_TASK_IDX': 'force'}, 'BC250 TASK IDX: applied', '17-bary-mesh-route'),
++    ('19-layer-mesh-route', 'feat_layer_task.mesh.spv', 'f.frag.spv', None, {}, '!BC250 TASK IDX: applied', None),
++    ('20-layer-task-idx', 'feat_layer_task.mesh.spv', 'f.frag.spv', None, {'RADV_BC250_MESH_TASK_IDX': 'force'}, 'BC250 TASK IDX: applied', '19-layer-mesh-route'),
++    ('21-multiview-mesh-route', 'feat_view_task.mesh.spv', 'f.frag.spv', None, {'INDEX_MULTIVIEW': '1'}, '!BC250 TASK IDX: applied', None),
++    ('22-multiview-task-idx', 'feat_view_task.mesh.spv', 'f.frag.spv', None, {'INDEX_MULTIVIEW': '1', 'RADV_BC250_MESH_TASK_IDX': 'force'}, 'BC250 TASK IDX: applied', '21-multiview-mesh-route'),
++    ('23-compact-task-idx-direct', 'compact_task128.mesh.spv', 'f.frag.spv', None, {'RADV_BC250_MESH_TASK_IDX': '1'}, 'BC250 TASK IDX: applied', None),
++    ('24-compact-task-idx-indirect', 'compact_task128.mesh.spv', 'f.frag.spv', 'count', {'RADV_BC250_MESH_TASK_IDX': '1'}, 'BC250 TASK IDX: applied', None),
++]
++
++
++def synced_write(path, text):
++    with open(path, 'w') as f:
++        f.write(text)
++        f.flush()
++        os.fsync(f.fileno())
++
++
++def image_stats(path):
++    data = open(path, 'rb').read()
++    lit = sum(1 for i in range(0, len(data), 4) if data[i:i + 3] != b'\0\0\0')
++    return hashlib.sha256(data).hexdigest(), lit
++
++
++def run_step(name, mesh, frag, indirect, extra, marker):
++    log_path = os.path.join(STATE, name + '.log')
++    image = os.path.join(STATE, name + '.rgba')
++    env = {'PATH': '/usr/bin:/bin', 'HOME': os.environ.get('HOME', '/tmp'),
++           'VK_DRIVER_FILES': os.path.join(KIT, 'driver', 'icd.json'), 'MESA_SHADER_CACHE_DISABLE': '1',
++           'BC250_TRACE_COMPILE': '1', 'BC250_IDX_TRACE': '1', 'BC250_INDEX_OWNER_AUTHORIZED': 'INDEX-once',
++           'RADV_BC250_MESH_SAFE_FAST': '1', 'INDEX_PRIMITIVES': '64'}
++    if indirect:
++        env['INDEX_INDIRECT'] = indirect
++    env.update(extra)
++    cmd = [os.path.join(KIT, 'index_gate'), '--authorized-gpu-INDEX', SH(mesh), SH(frag), image, SH('t.task.spv')]
++    log = open(log_path, 'w')
++    log.write('$ ' + ' '.join(f'{k}={v}' for k, v in extra.items()) + ' ' + ' '.join(cmd) + '\n')
++    proc = subprocess.Popen(cmd, env=env, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
++    # Raw reads from the pipe: a buffered reader can hold INDEX_READY while select() sees an empty pipe.
++    fd = proc.stdout.fileno()
++    text, ready, pending, deadline = [], False, b'', time.time() + 300
++    while not ready and time.time() < deadline:
++        if not select.select([fd], [], [], 1)[0]:
++            if proc.poll() is not None:
++                break
++            continue
++        chunk = os.read(fd, 65536)
++        if not chunk:
++            break
++        pending += chunk
++        while b'\n' in pending and not ready:
++            raw, pending = pending.split(b'\n', 1)
++            line = raw.decode(errors='replace') + '\n'
++            if not line.startswith('BC250POLICY'):
++                log.write(line)
++                text.append(line)
++            ready = line.startswith('INDEX_READY')
++    joined = ''.join(text)
++    route_ok = (marker[1:] not in joined) if marker.startswith('!') else (marker in joined)
++    if not ready or not route_ok:
++        proc.kill()
++        log.write(f'GATE: not released (ready={ready}, route as intended={route_ok})\n')
++        log.close()
++        return False, 'not released: ' + ('route not compiled as intended' if ready else 'compile/validation refused')
++    # Evidence first: the log and the "started" marker reach the disk before the GPU sees anything.
++    log.write('GATE: route verified, releasing the submission\n')
++    log.flush()
++    os.fsync(log.fileno())
++    synced_write(os.path.join(STATE, name + '.started'), time.strftime('%Y-%m-%dT%H:%M:%S\n'))
++    os.sync()
++    proc.stdin.write(b'S')
++    proc.stdin.close()
++    try:
++        rest, _ = proc.communicate(timeout=120)
++        rest = pending + rest
++    except subprocess.TimeoutExpired:
++        proc.kill()
++        log.write('GATE: no exit within 120 s\n')
++        log.close()
++        return False, 'timeout after submission'
++    log.write(''.join(l for l in rest.decode(errors='replace').splitlines(True) if not l.startswith('BC250POLICY')))
++    log.write(f'GATE: exit {proc.returncode}\n')
++    log.close()
++    if proc.returncode != 0 or not os.path.exists(image):
++        return False, f'exit {proc.returncode}'
++    synced_write(os.path.join(STATE, name + '.done'), time.strftime('%Y-%m-%dT%H:%M:%S\n'))
++    return True, ''
++
++
++def main():
++    os.makedirs(STATE, exist_ok=True)
++    for name, *_ in STEPS:
++        if os.path.exists(os.path.join(STATE, name + '.started')) and not os.path.exists(
++                os.path.join(STATE, name + '.done')):
++            sys.exit(f'STOP: step {name} started earlier and never finished (hang?). Do not retry; '
++                     f'send state/{name}.log.')
++    if not os.path.exists('/dev/dri'):
++        sys.exit('STOP: no /dev/dri (run on the BC-250 itself)')
++    busy = subprocess.run(['pgrep', '-af', 'ninja|cc1|steam_app|wine64-preloader|wineserver'],
++                          capture_output=True, text=True).stdout.strip()
++    if busy:
++        sys.exit('STOP: system not quiet, close these first:\n' + busy)
++    summary = []
++    for name, mesh, frag, indirect, extra, marker, match in STEPS:
++        if os.path.exists(os.path.join(STATE, name + '.done')):
++            print(f'SKIP {name} (passed in an earlier run)')
++            ok, why = True, ''
++        else:
++            print(f'RUN  {name} ...', flush=True)
++            ok, why = run_step(name, mesh, frag, indirect, extra, marker)
++        row = {'step': name, 'ok': ok, 'why': why}
++        if ok:
++            digest, lit = image_stats(os.path.join(STATE, name + '.rgba'))
++            row.update(sha256=digest, lit_pixels=lit)
++            if lit == 0:
++                ok, row['ok'], row['why'] = False, False, 'image is empty'
++            elif match:
++                other = image_stats(os.path.join(STATE, match + '.rgba'))[0]
++                row['matches'] = match
++                if other != digest:
++                    ok, row['ok'], row['why'] = False, False, f'image differs from {match}'
++        summary.append(row)
++        print(('PASS ' if ok else 'FAIL ') + name + ('' if ok else ': ' + row['why']) +
++              (f"  (lit pixels {row['lit_pixels']}" + (f", identical to {match}" if match and ok else '') + ')'
++               if 'lit_pixels' in row else ''), flush=True)
++        if not ok:
++            break
++    synced_write(os.path.join(KIT, 'summary.json'), json.dumps(summary, indent=2) + '\n')
++    passed = all(r['ok'] for r in summary) and len(summary) == len(STEPS)
++    print('GATE PASS: all steps' if passed else 'GATE STOPPED: see state/ and summary.json')
++    sys.exit(0 if passed else 1)
++
++
++if __name__ == '__main__':
++    main()
+diff --git a/tests/bc250-mesh/task-idx/make_gpu_kit.sh b/tests/bc250-mesh/task-idx/make_gpu_kit.sh
+new file mode 100755
+index 0000000..55abf75
+--- /dev/null
++++ b/tests/bc250-mesh/task-idx/make_gpu_kit.sh
+@@ -0,0 +1,42 @@
++#!/usr/bin/env bash
++# Build a self-contained BC-250 GPU gate kit (frozen driver, shaders, index_gate, gpu_gate.py).
++# usage: make_gpu_kit.sh <mesa build dir> <output kit dir>
++set -euo pipefail
++here=$(cd "$(dirname "$0")" && pwd)
++src=$(cd "$here/../../.." && pwd)
++build=$(cd "${1:?build dir}" && pwd)
++kit=${2:?kit dir}
++[ -e "$kit" ] && { echo "refusing to overwrite $kit" >&2; exit 1; }
++mkdir -p "$kit/driver" "$kit/shaders" "$kit/state"
++kit=$(cd "$kit" && pwd)
++cp "$build/src/amd/vulkan/libvulkan_radeon.so" "$kit/driver/"
++sed "s|\"library_path\": *\"[^\"]*\"|\"library_path\": \"$kit/driver/libvulkan_radeon.so\"|" \
++   "$build/src/amd/vulkan/radeon_devenv_icd.x86_64.json" > "$kit/driver/icd.json"
++grep -q "$kit/driver/libvulkan_radeon.so" "$kit/driver/icd.json"
++fx="$src/tests/bc250-mesh/split-admission"
++for m in dedup_task128 early_scratch_task128 dedup_task128_wide_np compact_task128 feat_cull_task feat_2d_task \
++         feat_numwg_task feat_primid_task feat_bary_task feat_layer_task feat_view_task; do
++   glslangValidator -S mesh --target-env vulkan1.3 -o "$kit/shaders/$m.mesh.spv" "$fx/$m.mesh" >/dev/null
++done
++for f in f early_scratch_task128 dedup_task128_wide_np feat_primid_task feat_bary_task; do
++   glslangValidator -S frag --target-env vulkan1.3 -o "$kit/shaders/$f.frag.spv" "$fx/$f.frag" >/dev/null
++done
++glslangValidator -S task --target-env vulkan1.3 -o "$kit/shaders/t.task.spv" "$fx/t.task" >/dev/null
++cc -O2 -o "$kit/index_gate" "$src/tests/bc250-mesh/index-pass/index_gate.c" -lvulkan
++cp "$here/gpu_gate.py" "$kit/run.py"
++chmod +x "$kit/run.py"
++commit=$(git -C "$src" rev-parse --short HEAD)
++cat > "$kit/README.txt" <<EOF
++BC-250 GPU gate: Task index route, shared atomics in the split, staging over dead shared memory.
++Driver: source $commit, frozen copy in driver/ (the installed driver is not touched).
++
++Run once, on a quiet system (close games, Steam, builds):
++    python3 $kit/run.py
++
++24 steps, lowest risk first, one GPU submission each; stops at the first failure. Steps 3, 4, 6 and every even step from 10 to 22 render a
++shader through the Task index route and must match the same shader on the Mesh route pixel for pixel.
++If the machine freezes: reboot and send state/ (the last .log is the step that was running). Do not rerun:
++the kit refuses to repeat a step that started and never finished.
++EOF
++(cd "$kit" && sha256sum driver/libvulkan_radeon.so index_gate shaders/*.spv run.py > SHA256SUMS)
++echo "kit: $kit"
+diff --git a/tests/bc250-mesh/task-idx/run.py b/tests/bc250-mesh/task-idx/run.py
+new file mode 100644
+index 0000000..f69f778
+--- /dev/null
++++ b/tests/bc250-mesh/task-idx/run.py
+@@ -0,0 +1,67 @@
++#!/usr/bin/env python3
++"""RADV_BC250_MESH_TASK_IDX recording gate (noop drm-shim only, never the GPU).
++
++Task + Mesh pipelines whose Mesh stage has no protected route (13 KB of application
++shared memory plus 10 vertex outputs: over the expansion's 28 KiB NGG window) are
++created as the Task index route and draws are recorded, direct and indirect, with
++NIR/ACO validation and the Vulkan validation layer's error count from index_gate.
++Passes are sized per pipeline; the drawn output itself is checked by the interpreter
++unit tests (radv_bc250_idx_tests: task_payload_*, task_chain_*)."""
++import argparse, re, subprocess
++from pathlib import Path
++
++p = argparse.ArgumentParser(description=__doc__)
++p.add_argument('--build', type=Path, required=True)
++p.add_argument('--shim', type=Path, required=True)
++p.add_argument('--gate', type=Path, required=True, help='index_gate built from tests/bc250-mesh/index-pass')
++p.add_argument('--out', type=Path, required=True)
++a = p.parse_args()
++src = Path(__file__).resolve().parents[1] / 'split-admission'
++out = a.out.resolve()
++out.mkdir(parents=True, exist_ok=True)
++icd = a.build.resolve() / 'src/amd/vulkan/radeon_devenv_icd.x86_64.json'
++
++def spv(stage, path, name):
++    target = out / name
++    subprocess.run(['glslangValidator', '-S', stage, '--target-env', 'vulkan1.3', '-o', str(target), str(path)],
++                   check=True, capture_output=True)
++    return target
++
++task = spv('task', src / 't.task', 't.spv')
++rows = 0
++# fixture, fragment shader, RADV_BC250_MESH_TASK_IDX value ('force' on shapes the Mesh route also takes)
++FIXTURES = [('dedup_task64_wide', 'dedup_task64_wide', '1'), ('dedup_task128_wide', 'dedup_task128_wide', '1'),
++            # feat_ssbo_task needs a bound storage buffer, which index_gate does not provide: its pipeline creation is
++            # covered by ../split-admission/run.sh.
++            ('compact_task128', 'f', '1'), ('feat_2d_task', 'f', 'force'),
++            ('feat_cull_task', 'f', 'force'), ('feat_numwg_task', 'f', 'force'),
++            ('feat_view_task', 'f', 'force', {'INDEX_MULTIVIEW': '1'}), ('feat_primid_task', 'feat_primid_task', 'force'),
++            ('feat_layer_task', 'f', 'force'), ('feat_bary_task', 'feat_bary_task', 'force')]
++for fixture, fragment, switch, *more in FIXTURES:
++    mesh = spv('mesh', src / (fixture + '.mesh'), fixture + '.spv')
++    frag = spv('frag', src / (fragment + '.frag'), fragment + '.frag.spv')
++    for mode in ('direct', 'count'):
++        env = dict(PATH='/usr/bin', HOME='/tmp', LD_PRELOAD=str(a.shim.resolve()), AMDGPU_GPU_ID='gfx1013',
++                   VK_DRIVER_FILES=str(icd), MESA_SHADER_CACHE_DISABLE='1', NIR_DEBUG='validate',
++                   ACO_DEBUG='validateir,validatera', BC250_TRACE_COMPILE='1', BC250_IDX_TRACE='1',
++                   RADV_DEBUG='dumpibs', INDEX_PRIMITIVES='64', RADV_BC250_MESH_TASK_IDX=switch)
++        if mode != 'direct':
++            env['INDEX_INDIRECT'] = mode
++        env.update(more[0] if more else {})
++        cmd = ['bwrap', '--ro-bind', '/', '/', '--dev', '/dev', '--proc', '/proc', '--tmpfs', '/tmp',
++               '--bind', str(out), str(out), '--unshare-pid', '--die-with-parent', '--', 'env', '-i',
++               *(f'{k}={v}' for k, v in env.items()),
++               str(a.gate.resolve()), '--offline', str(mesh), str(frag), str(out / 'o.rgba'), str(task)]
++        r = subprocess.run(cmd, capture_output=True, timeout=300)
++        log = r.stdout.decode() + r.stderr.decode()
++        tag = f'{fixture}-{mode}'
++        (out / (tag + '.log')).write_text(log)
++        assert r.returncode == 0, tag
++        assert 'NOOP_COMPLETE pixels_not_rendered' in log and 'VALIDATION_ERRORS=0' in log, tag
++        assert not re.search(r'(?i)validation failed|ACO ERROR|Assertion|Segmentation|VALIDATION:.*Error', log), tag
++        assert 'BC250 TASK IDX: applied' in log and 'draw skipped' not in log, tag
++        passes = len(re.findall(r'^BC250 TASK IDX: pass ', log, re.M))
++        assert passes > 0, tag
++        rows += 1
++        print('PASS', tag, 'index passes recorded:', passes, flush=True)
++print('PASS', rows, 'Task index recordings; no GPU execution')
 diff --git a/tests/bc250-mesh/vrs-noop/README.md b/tests/bc250-mesh/vrs-noop/README.md
 new file mode 100644
 index 0000000..280f736
