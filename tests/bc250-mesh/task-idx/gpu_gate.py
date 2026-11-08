@@ -56,7 +56,7 @@ def run_step(name, mesh, frag, indirect, extra, marker):
     if indirect:
         env['INDEX_INDIRECT'] = indirect
     env.update(extra)
-    cmd = [os.path.join(KIT, 'index_gate'), SH(mesh), SH(frag), image, SH('t.task.spv')]
+    cmd = [os.path.join(KIT, 'index_gate'), '--authorized-gpu-INDEX', SH(mesh), SH(frag), image, SH('t.task.spv')]
     log = open(log_path, 'w')
     log.write('$ ' + ' '.join(f'{k}={v}' for k, v in extra.items()) + ' ' + ' '.join(cmd) + '\n')
     proc = subprocess.Popen(cmd, env=env, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
