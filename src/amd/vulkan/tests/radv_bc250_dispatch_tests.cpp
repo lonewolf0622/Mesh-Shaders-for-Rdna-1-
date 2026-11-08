@@ -168,7 +168,7 @@ TEST(radv_directmesh, activation_override)
 }
 
 /* The settings table must stay value-for-value identical to the preset that
- * radv_bc250_directmesh_env() used to write with setenv() (v1.3.1 + auto IDX). */
+ * radv_bc250_directmesh_env() used to write with setenv() (v1.3.1 + auto IDX), plus the Task index route. */
 TEST(radv_directmesh, preset_table_matches_previous_setenv_preset)
 {
    static const struct radv_directmesh_setting expected[] = {
@@ -243,6 +243,7 @@ TEST(radv_directmesh, preset_table_matches_previous_setenv_preset)
       {"RADV_BC250_EXPOSE_DGC", "1"},
       {"RADV_BC250_NGGC_WIDE", "1"},
       {"RADV_BC250_DCC_32B", "1"},
+      {"RADV_BC250_MESH_TASK_IDX", "1"},
    };
    unsigned count = 0;
    const struct radv_directmesh_setting *table = radv_directmesh_settings_table(&count);

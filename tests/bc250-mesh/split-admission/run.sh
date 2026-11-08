@@ -89,16 +89,17 @@ tri128_shatomic|tri128_shatomic|-||0|split shared atomics admitted: pieces=2
 # shared atomics behind Task (the shape of the refused NX2navi pipelines)
 dedup_task64|dedup_task64|t||0|MESH SAFE OWNED
 dedup_task128|dedup_task128|t||0|split shared atomics admitted: pieces=2 (primitive slicing proven independent)
-dedup_task64_wide|dedup_task64_wide|t||-8|split rejected: required vertex expansion unavailable
-dedup_task128_wide|dedup_task128_wide|t||-8|split rejected: required vertex expansion unavailable
-compact_task128|compact_task128|t||-8|split rejected: shared atomics select a per-primitive slot
+dedup_task64_wide|dedup_task64_wide|t|RADV_BC250_MESH_TASK_IDX=0|-8|split rejected: required vertex expansion unavailable
+dedup_task128_wide|dedup_task128_wide|t|RADV_BC250_MESH_TASK_IDX=0|-8|split rejected: required vertex expansion unavailable
+compact_task128|compact_task128|t|RADV_BC250_MESH_TASK_IDX=0|-8|split rejected: shared atomics select a per-primitive slot
 # over the 28 KiB staging budget, but the staging arrays fit over scratch that is dead before the outputs
 early_scratch_task128|early_scratch_task128|t||0|BC250 MESH STAGING ALIAS: applied
 early_scratch_end_task128|early_scratch_end_task128|t||0|BC250 MESH STAGING ALIAS: applied
 # no per-primitive attributes (as reported): V=128 P=64 fits the ordinary route, V=160 P=128 reads its scratch late
 dedup_task64_wide_np|dedup_task64_wide_np|t||0|-
-dedup_task128_wide_np|dedup_task128_wide_np|t||-8|split rejected: required vertex expansion unavailable
+dedup_task128_wide_np|dedup_task128_wide_np|t|RADV_BC250_MESH_TASK_IDX=0|-8|split rejected: required vertex expansion unavailable
 dedup_task128_wide_np_idx|dedup_task128_wide_np|t|RADV_BC250_MESH_TASK_IDX=1|0|BC250 TASK IDX: applied
+# (the rows above turn the Task index route off: it is on by default in the DirectMesh preset)
 # RADV_BC250_MESH_TASK_IDX: the refused Task pipelines run as the Task index route (the index pass runs the
 # Mesh body once per workgroup in a compute shader: full LDS, shared atomics keep their meaning)
 dedup_task64_wide_idx|dedup_task64_wide|t|RADV_BC250_MESH_TASK_IDX=1|0|BC250 TASK IDX: applied

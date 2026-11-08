@@ -80,7 +80,7 @@ radv_bc250_device_env_init(struct radv_device *device, const struct radv_physica
    env->no_split_l2_inv = debug_get_bool_option("RADV_BC250_PERF_NO_SPLIT_L2_INV", false);
    env->split_batch_trace = debug_get_bool_option("RADV_BC250_SPLIT_BATCH_TRACE", false);
    env->merge_prep_l2_inv = debug_get_bool_option("RADV_BC250_MESH_MERGE_PREP_L2_INV", false);
-   /* RADV_BC250_MESH_TASK_IDX (default off): Task + Mesh pipelines without a protected Mesh route run the
+   /* RADV_BC250_MESH_TASK_IDX (on in the DirectMesh preset): Task + Mesh pipelines without a protected Mesh route run the
     * hybrid producer and the stored index route instead of failing. TASK_IDX_PASSES index passes per
     * producer chunk (0, the default: 16, the maximum); records beyond them are not drawn. */
    /* =force (testing): every Task + Mesh pipeline the route admits uses it, so the same shader can be compared

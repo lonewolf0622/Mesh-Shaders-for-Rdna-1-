@@ -69,6 +69,9 @@ static const struct radv_directmesh_setting radv_directmesh_settings[] = {
    {"RADV_BC250_TASK_TAIL", "1"}, {"RADV_BC250_EXPOSE_DGC", "1"},
    /* GDDR6-class settings for this APU-reported GPU: wider NGG culling admission, 32B DCC blocks. */
    {"RADV_BC250_NGGC_WIDE", "1"}, {"RADV_BC250_DCC_32B", "1"},
+   /* Task + Mesh pipelines without a protected Mesh route run as the Task index route (GPU gate: 24/24, images
+    * identical to the Mesh route). */
+   {"RADV_BC250_MESH_TASK_IDX", "1"},
 };
 
 /* Written once per instance creation before any option is read; only ever
