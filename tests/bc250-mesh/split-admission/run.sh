@@ -89,8 +89,14 @@ tri128_shatomic|tri128_shatomic|-||0|split shared atomics admitted: pieces=2
 # shared atomics behind Task (the shape of the refused NX2navi pipelines)
 dedup_task64|dedup_task64|t||0|MESH SAFE OWNED
 dedup_task128|dedup_task128|t||0|split shared atomics admitted: pieces=2 (primitive slicing proven independent)
-dedup_task64_wide|dedup_task64_wide|t||0|-
-dedup_task128_wide|dedup_task128_wide|t||0|split shared atomics admitted
+dedup_task64_wide|dedup_task64_wide|t||-8|split rejected: required vertex expansion unavailable
+dedup_task128_wide|dedup_task128_wide|t||-8|split rejected: required vertex expansion unavailable
 compact_task128|compact_task128|t||-8|split rejected: shared atomics select a per-primitive slot
+# RADV_BC250_MESH_TASK_IDX: the refused Task pipelines run as the Task index route (the index pass runs the
+# Mesh body once per workgroup in a compute shader: full LDS, shared atomics keep their meaning)
+dedup_task64_wide_idx|dedup_task64_wide|t|RADV_BC250_MESH_TASK_IDX=1|0|BC250 TASK IDX: applied
+dedup_task128_wide_idx|dedup_task128_wide|t|RADV_BC250_MESH_TASK_IDX=1|0|BC250 TASK IDX: applied
+# the index route also needs lane-owned output stores: compaction stays refused
+compact_task128_idx|compact_task128|t|RADV_BC250_MESH_TASK_IDX=1|-8|BC250 TASK IDX: declined (vertex store not owned
 EOF
 exit $fail

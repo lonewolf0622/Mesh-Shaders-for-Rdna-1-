@@ -594,6 +594,8 @@ struct radv_cmd_buffer {
    uint64_t bc250_idx_offset;
    struct radeon_winsys_bo *bc250_idx_pool_bo;
    bool bc250_idx_pool_used;
+   /* RADV_BC250_MESH_TASK_IDX: two table sets, used alternately by consecutive index passes. */
+   uint64_t bc250_task_idx_tables[2];
    /* RADV_BC250_MESH_IDXPASS batch: the index passes of consecutive draws are recorded into this side stream; one
     * call reserved before the first of those draws runs them (copied into body at close) followed by one wait. */
    struct radv_cmd_stream *bc250_idx_batch;

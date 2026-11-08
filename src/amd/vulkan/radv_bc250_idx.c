@@ -259,9 +259,67 @@ bc250_idx_indirect_prologue(nir_builder *b, unsigned V, unsigned P, nir_variable
                      nir_u2u64(b, nir_iadd(b, nir_imul_imm(b, first, 4), nir_imul_imm(b, local, P * 12))));
 }
 
+/* Task index route: lower the Mesh shader's task payload reads to the hybrid producer's payload records,
+ * one per index-pass record (constants.compute_args + record * stride), after the application constants. */
+static void
+bc250_idx_lower_task_payload(nir_shader *cs, nir_variable *draw_var, unsigned payload_stride)
+{
+   nir_function_impl *impl = nir_shader_get_entrypoint(cs);
+   nir_builder b = nir_builder_create(impl);
+   nir_foreach_block_safe (block, impl) {
+      nir_foreach_instr_safe (instr, block) {
+         if (instr->type != nir_instr_type_intrinsic)
+            continue;
+         nir_intrinsic_instr *in = nir_instr_as_intrinsic(instr);
+         if (in->intrinsic == nir_intrinsic_barrier) {
+            const nir_variable_mode modes = nir_intrinsic_memory_modes(in);
+            if (modes & nir_var_mem_task_payload)
+               nir_intrinsic_set_memory_modes(in, (modes & ~nir_var_mem_task_payload) | nir_var_mem_global);
+            continue;
+         }
+         if (in->intrinsic != nir_intrinsic_load_task_payload)
+            continue;
+         b.cursor = nir_before_instr(instr);
+         nir_def *offset = nir_iadd_imm(&b, in->src[0].ssa, nir_intrinsic_base(in));
+         nir_def *record = nir_load_var(&b, draw_var);
+         nir_def *addr = nir_iadd(&b, bc250_pointer(&b, 48),
+                                  nir_u2u64(&b, nir_iadd(&b, nir_imul_imm(&b, record, payload_stride), offset)));
+         const unsigned align_mul = MIN2(nir_intrinsic_align_mul(in), 16);
+         nir_def *value = nir_load_global(&b, in->def.num_components, in->def.bit_size, addr, .align_mul = align_mul,
+                                          .align_offset = nir_intrinsic_align_offset(in) % align_mul,
+                                          .access = ACCESS_NON_WRITEABLE);
+         nir_def_rewrite_uses(&in->def, value);
+         nir_instr_remove(instr);
+      }
+   }
+   nir_progress(true, impl, nir_metadata_none);
+   NIR_PASS(_, cs, nir_remove_dead_derefs);
+   NIR_PASS(_, cs, nir_remove_dead_variables, nir_var_mem_task_payload, NULL);
+   cs->info.task_payload_size = 0;
+}
+
+static nir_shader *
+bc250_idx_build_cs(const nir_shader *mesh, bool indirect, unsigned provoking, unsigned output_bytes,
+                   nir_intrinsic_pass_cb lower_constants, unsigned payload_stride);
+
 nir_shader *
 radv_bc250_idx_build_cs(const nir_shader *mesh, bool indirect, unsigned provoking, unsigned output_bytes,
                         nir_intrinsic_pass_cb lower_constants)
+{
+   return bc250_idx_build_cs(mesh, indirect, provoking, output_bytes, lower_constants, 0);
+}
+
+nir_shader *
+radv_bc250_idx_build_task_cs(const nir_shader *mesh, unsigned provoking, unsigned output_bytes,
+                             nir_intrinsic_pass_cb lower_constants, unsigned payload_stride)
+{
+   assert(payload_stride && output_bytes);
+   return bc250_idx_build_cs(mesh, true, provoking, output_bytes, lower_constants, payload_stride);
+}
+
+static nir_shader *
+bc250_idx_build_cs(const nir_shader *mesh, bool indirect, unsigned provoking, unsigned output_bytes,
+                   nir_intrinsic_pass_cb lower_constants, unsigned payload_stride)
 {
    nir_shader *cs = nir_shader_clone(NULL, mesh);
    NIR_PASS(_, cs, nir_split_var_copies);
@@ -282,6 +340,10 @@ radv_bc250_idx_build_cs(const nir_shader *mesh, bool indirect, unsigned provokin
             nir_intrinsic_instr *in = nir_instr_as_intrinsic(instr);
             if (in->intrinsic != nir_intrinsic_load_workgroup_id && in->intrinsic != nir_intrinsic_load_draw_id)
                continue;
+            /* Task index route: the record is the producer workgroup; the application's DrawID stays the
+             * draw's own (constants.application_draw_id, through lower_constants). */
+            if (payload_stride && in->intrinsic == nir_intrinsic_load_draw_id)
+               continue;
             b.cursor = nir_before_instr(instr);
             nir_def *v = nir_load_var(&b, in->intrinsic == nir_intrinsic_load_draw_id ? draw_var : wg_var);
             nir_def_rewrite_uses(&in->def, nir_trim_vector(&b, v, in->def.num_components));
@@ -292,6 +354,8 @@ radv_bc250_idx_build_cs(const nir_shader *mesh, bool indirect, unsigned provokin
    /* Direct: the whole grid is one dispatch, WorkGroupID and NumWorkGroups stay the hardware values. */
    if (lower_constants)
       NIR_PASS(_, cs, nir_shader_intrinsics_pass, lower_constants, nir_metadata_none, NULL);
+   if (payload_stride)
+      bc250_idx_lower_task_payload(cs, draw_var, payload_stride);
    /* Application returns end the body only: the epilogue below runs in every invocation. The prologue's exit
     * (whole workgroup) is lowered after the epilogue exists. */
    NIR_PASS(_, cs, nir_lower_returns);

@@ -145,6 +145,11 @@ struct radv_graphics_pipeline {
    /* RADV_BC250_MESH_IDXPASS: index-pass compute pipeline (+ its layout) and the indexed-draw pipeline. */
    VkPipeline bc250_idx_cs;
    VkPipeline bc250_idx_gfx;
+   /* Task index route (RADV_BC250_MESH_TASK_IDX): a Task + Mesh pipeline with no Mesh route. This pipeline is
+    * itself the index route's vertex/fragment pipeline (bc250_idx_gfx points back to it) and every Task draw
+    * runs the hybrid producer, then index passes over its records. */
+   bool bc250_task_idx;
+   unsigned bc250_task_idx_passes;
    VkPipelineLayout bc250_idx_layout;
    /* Indirect draws: the setup pass (+ its layout) and the indirect index pass. */
    VkPipeline bc250_idx_setup;

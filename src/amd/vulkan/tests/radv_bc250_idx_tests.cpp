@@ -27,12 +27,17 @@ protected:
       return nir_build_deref_array(b, nir_build_deref_var(b, v), index);
    }
 
-   void program(bool primitive, bool ballot, bool shared, unsigned count)
+   void program(bool primitive, bool ballot, bool shared, unsigned count, bool payload = false)
    {
       nir_def *i = nir_load_local_invocation_index(b);
       nir_def *g = nir_channel(b, nir_load_workgroup_id(b), 0);
       nir_set_vertex_and_primitive_count(b, nir_imm_int(b, 64), nir_imm_int(b, count), nir_imm_int(b, 0));
       nir_def *value = nir_iadd(b, i, nir_imul_imm(b, g, 100));
+      if (payload) {
+         /* Task index route: the record's payload word 1 (the producer wrote it for this record). */
+         b->shader->info.task_payload_size = 16;
+         value = nir_iadd(b, value, nir_load_task_payload(b, 1, 32, nir_imm_int(b, 4), .base = 0, .align_mul = 4));
+      }
       if (ballot) {
          nir_def *votes = nir_ballot(b, 4, 32, nir_imm_true(b));
          value = nir_iadd(
@@ -67,9 +72,9 @@ protected:
    }
 
    void roundtrip(bool primitive, bool ballot, bool shared, unsigned count, unsigned provoking, bool indirect,
-                  bool prune = false, bool dead_primitive = false)
+                  bool prune = false, bool dead_primitive = false, bool payload = false)
    {
-      program(primitive, ballot, shared, count);
+      program(primitive, ballot, shared, count, payload);
       if (prune) {
          nir_def *lane = nir_load_local_invocation_index(b);
          for (unsigned i = 0; i < 2; i++) {
@@ -98,7 +103,9 @@ protected:
       const unsigned bytes = radv_bc250_idx_output_layout(b->shader);
       ASSERT_EQ(bytes, kept_primitive ? 1792u : 1536u);
       EXPECT_EQ(bc250_idx_has_pp(b->shader), kept_primitive);
-      nir_shader *cs = radv_bc250_idx_build_cs(b->shader, indirect, provoking, bytes, NULL);
+      nir_shader *cs = payload ? radv_bc250_idx_build_task_cs(b->shader, provoking, bytes, NULL, 16)
+                               : radv_bc250_idx_build_cs(b->shader, indirect, provoking, bytes, NULL);
+      EXPECT_EQ(cs->info.task_payload_size, 0u);
       nir_shader *vs = radv_bc250_idx_build_stored_vs(b->shader->options, b->shader, bytes);
       nir_foreach_shader_out_variable (v, vs)
          v->data.driver_location = v->data.location;
@@ -106,7 +113,10 @@ protected:
       nir_remove_dead_derefs(vs);
       nir_validate_shader(cs, "producer oracle");
       nir_validate_shader(vs, "fetch oracle");
-      constexpr uint64_t ibva = 0x100000, outva = 0x200000, dimsva = 0x300000, drawsva = 0x400000, tabva = 0x500000;
+      constexpr uint64_t ibva = 0x100000, outva = 0x200000, dimsva = 0x300000, drawsva = 0x400000, tabva = 0x500000,
+                         payloadva = 0x600000;
+      /* Two 16-byte payload records; the draw's workgroups belong to record 1 (word 1 = 700). */
+      std::vector<uint32_t> payloads = {1, 2, 3, 4, 500, 700, 900, 1100};
       constexpr unsigned groups = 3;
       const unsigned first = indirect ? 101 : 0;
       std::vector<uint8_t> ib(first * 4 + groups * (64 * 12 + bytes), 0xa5), data(groups * bytes, 0xa5);
@@ -118,11 +128,12 @@ protected:
                            {outva, data.size(), data.data()},
                            {dimsva, dims.size() * 4, (uint8_t *)dims.data()},
                            {drawsva, draws.size() * 4, (uint8_t *)draws.data()},
-                           {tabva, table.size() * 4, (uint8_t *)table.data()}};
+                           {tabva, table.size() * 4, (uint8_t *)table.data()},
+                           {payloadva, payloads.size() * 4, (uint8_t *)payloads.data()}};
       fetch.mappings = producer.mappings;
       producer.shared_memory.resize(cs->info.shared_size, 0);
       uint64_t constants[9] = {indirect ? tabva : 0,   ibva, 64 * 12, 0, indirect ? dimsva : outva,
-                               indirect ? drawsva : 0, 0,    0,       0};
+                               indirect ? drawsva : 0, payload ? payloadva : 0, 0, 0};
       producer.push_constants.assign((uint8_t *)constants, (uint8_t *)(constants + 9));
       fetch.push_constants = producer.push_constants;
       fetch.draw_id = indirect ? 1 : 0;
@@ -142,7 +153,7 @@ protected:
                EXPECT_EQ(k, g * (kept_primitive ? 64 * 65 : 64) + v + (kept_primitive && c == provoking ? (p + 1) * 64 : 0));
                fetch.vertex_id = k;
                fetch.run(vs, 0, 0);
-               const unsigned expected = v + g * 100 + (ballot ? 64 : 0);
+               const unsigned expected = v + g * 100 + (ballot ? 64 : 0) + (payload ? 700 : 0);
                EXPECT_EQ(fetch.outputs[VARYING_SLOT_POS * 4], expected);
                EXPECT_EQ(fetch.outputs[VARYING_SLOT_POS * 4 + 1], v);
                EXPECT_EQ(fetch.outputs[VARYING_SLOT_POS * 4 + 2], g);
@@ -191,6 +202,14 @@ TEST_F(radv_bc250_idx_test, indirect_ballot_outputs)
 TEST_F(radv_bc250_idx_test, indirect_unused_primitives)
 {
    roundtrip(true, false, false, 48, 2, true);
+}
+TEST_F(radv_bc250_idx_test, task_payload_outputs)
+{
+   roundtrip(true, true, false, 64, 0, true, false, false, true);
+}
+TEST_F(radv_bc250_idx_test, task_payload_unused_primitives)
+{
+   roundtrip(true, false, true, 48, 2, true, false, false, true);
 }
 
 TEST_F(radv_bc250_idx_test, pruned_direct_shared_outputs)
@@ -433,6 +452,95 @@ idx_setup_check(const nir_shader_compiler_options *options, bool stored, unsigne
    EXPECT_EQ(table[8 + n], groups);
    EXPECT_EQ(pool[0], fallback ? capacity : used);
    ralloc_free(setup);
+}
+
+/* RADV_BC250_MESH_TASK_IDX pass chaining: pass p consumes pass p - 1's overflow records (its mesh array, with
+ * the records that fitted zeroed) and its fallback count (table + 20), with the pool restarted at zero. Every
+ * record is drawn by exactly one pass, in order, and the chain ends with a zero count. */
+static unsigned
+idx_task_chain_check(const nir_shader_compiler_options *options, unsigned actual_count, unsigned capacity,
+                     unsigned max_passes)
+{
+   const unsigned nmax = 65, P = 64, V = 64 * 65, output_bytes = 1792;
+   nir_shader *setup = radv_bc250_idx_build_setup(options, true);
+   nir_opt_dce(setup);
+   nir_remove_dead_derefs(setup);
+   constexpr uint64_t records_va = 0x100000, count_va = 0x200000, pool_va = 0x700000;
+   constexpr uint64_t table_va[2] = {0x300000, 0x800000}, dims_va[2] = {0x400000, 0x900000};
+   constexpr uint64_t draws_va[2] = {0x500000, 0xa00000}, mesh_va[2] = {0x600000, 0xb00000};
+   std::vector<uint32_t> records(nmax * 3), pool(64, 0);
+   std::vector<uint32_t> table[2], dims[2], draws[2], mesh[2];
+   for (unsigned t = 0; t < 2; t++) {
+      table[t].assign(8 + nmax + 1, 0xa5a5a5a5);
+      dims[t].assign(nmax * 3, 0xa5a5a5a5);
+      draws[t].assign(nmax * 5, 0xa5a5a5a5);
+      mesh[t].assign(nmax * 3, 0xa5a5a5a5);
+   }
+   pool[0] = 12345; /* stale use from earlier draws: every pass restarts */
+   for (unsigned i = 0; i < nmax; i++) {
+      records[i * 3] = i % 7 ? i % 3 + 1 : 0;
+      records[i * 3 + 1] = records[i * 3 + 2] = 1;
+   }
+   std::vector<unsigned> drawn_by(nmax, ~0u);
+   unsigned passes = 0;
+   uint64_t in_records = records_va, in_count = count_va;
+   for (; passes < max_passes; passes++) {
+      const unsigned t = passes & 1, prev = t ^ 1;
+      std::vector<uint32_t> in_mesh = passes ? mesh[prev] : records;
+      const uint32_t in_n = passes ? table[prev][5] : actual_count;
+      if (passes && !in_n)
+         break;
+      bc250_idx_setup_args args = {in_records, in_count, table_va[t], dims_va[t], draws_va[t], mesh_va[t], pool_va,
+                                   12,         nmax,     capacity,    P,          1,          V,          output_bytes};
+      idx_run_setup(setup, &args, sizeof(args),
+                    {{in_records, in_mesh.size() * 4, (uint8_t *)in_mesh.data()},
+                     {in_count, 4, (uint8_t *)&in_n},
+                     {table_va[t], table[t].size() * 4, (uint8_t *)table[t].data()},
+                     {dims_va[t], dims[t].size() * 4, (uint8_t *)dims[t].data()},
+                     {draws_va[t], draws[t].size() * 4, (uint8_t *)draws[t].data()},
+                     {mesh_va[t], mesh[t].size() * 4, (uint8_t *)mesh[t].data()},
+                     {pool_va, pool.size() * 4, (uint8_t *)pool.data()}});
+      uint64_t used = 0;
+      /* The indexed draw reads table[0] entries; later entries keep stale contents. */
+      for (unsigned i = 0; i < table[t][0]; i++) {
+         if (!draws[t][i * 5 + 1])
+            continue;
+         EXPECT_EQ(drawn_by[i], ~0u) << "record " << i << " drawn twice";
+         EXPECT_EQ(draws[t][i * 5 + 2], used) << "pass " << passes << " restarts the pool";
+         EXPECT_EQ(dims[t][i * 3], records[i * 3]);
+         drawn_by[i] = passes;
+         used += uint64_t(records[i * 3]) * (P * 12 + output_bytes) / 4;
+      }
+      in_records = mesh_va[t];
+      in_count = table_va[t] + 20;
+   }
+   unsigned last = 0;
+   for (unsigned i = 0; i < std::min(nmax, actual_count); i++) {
+      if (!records[i * 3])
+         continue;
+      EXPECT_NE(drawn_by[i], ~0u) << "record " << i << " never drawn";
+      EXPECT_GE(drawn_by[i], last) << "record " << i << " out of order";
+      last = drawn_by[i];
+   }
+   for (unsigned i = actual_count; i < nmax; i++)
+      EXPECT_EQ(drawn_by[i], ~0u);
+   ralloc_free(setup);
+   return passes;
+}
+
+TEST_F(radv_bc250_idx_test, task_chain_covers_overflow)
+{
+   /* 20000 words hold 31 groups of 640 words; the 65 records need 111 groups. */
+   EXPECT_EQ(idx_task_chain_check(b->shader->options, 65, 20000, 16), 4u);
+}
+TEST_F(radv_bc250_idx_test, task_chain_single_pass)
+{
+   EXPECT_EQ(idx_task_chain_check(b->shader->options, 65, 1u << 22, 16), 1u);
+}
+TEST_F(radv_bc250_idx_test, task_chain_partial_count)
+{
+   /* 5 groups per pass; in order, groups 0 2 3 | 1 2 | 3 1 0 | 3 1 | 2 3 | 1 2 0 1 | 2 3 | 1 2. */
+   EXPECT_EQ(idx_task_chain_check(b->shader->options, 20, 3200, 16), 8u);
 }
 
 TEST_F(radv_bc250_idx_test, setup_exact_capacity)

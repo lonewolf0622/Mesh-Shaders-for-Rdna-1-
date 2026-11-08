@@ -4391,6 +4391,10 @@ radv_graphics_pipeline_create(VkDevice _device, VkPipelineCache _cache, const Vk
    result = radv_graphics_pipeline_init(pipeline, device, cache, pCreateInfo);
    if (result != VK_SUCCESS) {
       radv_pipeline_destroy(device, &pipeline->base, pAllocator);
+      /* RADV_BC250_MESH_TASK_IDX: a Task + Mesh pipeline without a protected Mesh route runs as the
+       * Task index route instead of failing. */
+      if (result == VK_ERROR_FEATURE_NOT_PRESENT && device->bc250_env.task_idx && _cache != device->meta_state.cache)
+         return radv_bc250_task_idx_pipeline_create(device, pCreateInfo, pAllocator, pPipeline);
       return result;
    }
 
@@ -4438,7 +4442,8 @@ radv_destroy_graphics_pipeline(struct radv_device *device, struct radv_graphics_
       radv_DestroyPipeline(radv_device_to_handle(device), pipeline->bc250_task_pipeline, NULL);
    if (pipeline->bc250_idx_cs)
       radv_DestroyPipeline(radv_device_to_handle(device), pipeline->bc250_idx_cs, NULL);
-   if (pipeline->bc250_idx_gfx)
+   /* The Task index route's pipeline is its own index-route pipeline. */
+   if (pipeline->bc250_idx_gfx && pipeline->bc250_idx_gfx != radv_pipeline_to_handle(&pipeline->base))
       radv_DestroyPipeline(radv_device_to_handle(device), pipeline->bc250_idx_gfx, NULL);
    if (pipeline->bc250_idx_layout)
       radv_DestroyPipelineLayout(radv_device_to_handle(device), pipeline->bc250_idx_layout, NULL);

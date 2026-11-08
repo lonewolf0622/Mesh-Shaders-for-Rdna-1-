@@ -166,6 +166,8 @@ struct radv_bc250_device_env {
    bool split_batch_trace;    /* RADV_BC250_SPLIT_BATCH_TRACE */
    bool merge_prep_l2_inv;    /* RADV_BC250_MESH_MERGE_PREP_L2_INV */
    /* Index-route switches read once here instead of on every draw. */
+   bool task_idx;             /* RADV_BC250_MESH_TASK_IDX */
+   unsigned task_idx_passes;  /* RADV_BC250_MESH_TASK_IDX_PASSES, 0 = per pipeline */
    bool idx_trace;            /* BC250_IDX_TRACE */
    bool idx_debug;            /* RADV_BC250_IDX_DEBUG */
    bool idx_capture_batch;    /* BC250_IDX_CAPTURE_BATCH */

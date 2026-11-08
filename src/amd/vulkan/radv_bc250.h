@@ -8,6 +8,8 @@ struct radv_device;
 struct radv_graphics_pipeline;
 struct radv_graphics_pipeline_state;
 struct radv_cmd_buffer;
+VkResult radv_bc250_task_idx_pipeline_create(struct radv_device *device, const VkGraphicsPipelineCreateInfo *pCreateInfo,
+                                             const VkAllocationCallbacks *pAllocator, VkPipeline *pPipeline);
 void radv_bc250_idx_create(struct radv_device *device, struct radv_graphics_pipeline *pipeline,
                            const VkGraphicsPipelineCreateInfo *pCreateInfo);
 bool radv_bc250_draw_idx(struct radv_cmd_buffer *cmd_buffer, struct radv_graphics_pipeline *pipeline,

@@ -52,6 +52,9 @@ unsigned radv_bc250_idx_output_layout(nir_shader *mesh);
 bool radv_bc250_idx_prune_outputs(nir_shader *mesh, const nir_shader *fragment);
 nir_shader *radv_bc250_idx_build_cs(const nir_shader *mesh, bool indirect, unsigned provoking, unsigned output_bytes,
                                     nir_intrinsic_pass_cb lower_constants);
+/* Task index route: always indirect and stored; task payload reads use constants.compute_args. */
+nir_shader *radv_bc250_idx_build_task_cs(const nir_shader *mesh, unsigned provoking, unsigned output_bytes,
+                                         nir_intrinsic_pass_cb lower_constants, unsigned payload_stride);
 nir_shader *radv_bc250_idx_build_stored_vs(const nir_shader_compiler_options *options, const nir_shader *mesh,
                                            unsigned output_bytes);
 
