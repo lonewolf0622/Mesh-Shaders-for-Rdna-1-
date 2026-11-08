@@ -20,7 +20,10 @@ extern "C" {
 static inline bool
 bc250_idx_has_pp(const nir_shader *mesh)
 {
-   return mesh->info.per_primitive_outputs & (UINT64_C(0xffffffff) << VARYING_SLOT_VAR0);
+   /* Layer and Viewport only reach the index route through the Task index route, which stores them like generic
+    * primitive attributes (the vertex shader exports them from the provoking vertex). */
+   return mesh->info.per_primitive_outputs &
+          ((UINT64_C(0xffffffff) << VARYING_SLOT_VAR0) | VARYING_BIT_LAYER | VARYING_BIT_VIEWPORT);
 }
 
 static inline unsigned

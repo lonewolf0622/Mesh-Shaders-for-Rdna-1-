@@ -34,8 +34,10 @@ FIXTURES = [('dedup_task64_wide', 'dedup_task64_wide', '1'), ('dedup_task128_wid
             # feat_ssbo_task needs a bound storage buffer, which index_gate does not provide: its pipeline creation is
             # covered by ../split-admission/run.sh.
             ('compact_task128', 'f', '1'), ('feat_2d_task', 'f', 'force'),
-            ('feat_cull_task', 'f', 'force'), ('feat_numwg_task', 'f', 'force')]
-for fixture, fragment, switch in FIXTURES:
+            ('feat_cull_task', 'f', 'force'), ('feat_numwg_task', 'f', 'force'),
+            ('feat_view_task', 'f', 'force', {'INDEX_MULTIVIEW': '1'}), ('feat_primid_task', 'feat_primid_task', 'force'),
+            ('feat_layer_task', 'f', 'force'), ('feat_bary_task', 'feat_bary_task', 'force')]
+for fixture, fragment, switch, *more in FIXTURES:
     mesh = spv('mesh', src / (fixture + '.mesh'), fixture + '.spv')
     frag = spv('frag', src / (fragment + '.frag'), fragment + '.frag.spv')
     for mode in ('direct', 'count'):
@@ -45,6 +47,7 @@ for fixture, fragment, switch in FIXTURES:
                    RADV_DEBUG='dumpibs', INDEX_PRIMITIVES='64', RADV_BC250_MESH_TASK_IDX=switch)
         if mode != 'direct':
             env['INDEX_INDIRECT'] = mode
+        env.update(more[0] if more else {})
         cmd = ['bwrap', '--ro-bind', '/', '/', '--dev', '/dev', '--proc', '/proc', '--tmpfs', '/tmp',
                '--bind', str(out), str(out), '--unshare-pid', '--die-with-parent', '--', 'env', '-i',
                *(f'{k}={v}' for k, v in env.items()),

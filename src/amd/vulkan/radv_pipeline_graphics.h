@@ -150,6 +150,8 @@ struct radv_graphics_pipeline {
     * runs the hybrid producer, then index passes over its records. */
    bool bc250_task_idx;
    unsigned bc250_task_idx_passes;
+   /* Producer chunk size: BC250_TASK_CHUNK, larger for the Task index route. */
+   unsigned bc250_task_chunk;
    VkPipelineLayout bc250_idx_layout;
    /* Indirect draws: the setup pass (+ its layout) and the indirect index pass. */
    VkPipeline bc250_idx_setup;

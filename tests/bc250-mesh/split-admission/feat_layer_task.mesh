@@ -1,0 +1,17 @@
+#version 460
+#extension GL_EXT_mesh_shader : require
+// Task index route feature: per-primitive gl_Layer and gl_ViewportIndex (single layer / viewport 0 here).
+layout(local_size_x=128) in;
+layout(triangles, max_vertices=128, max_primitives=64) out;
+layout(location=0) perprimitiveEXT flat out vec4 pcol[];
+struct P { uint base; }; taskPayloadSharedEXT P pl;
+void main(){
+ uint i=gl_LocalInvocationIndex;
+ SetMeshOutputsEXT(128,64);
+ gl_MeshVerticesEXT[i].gl_Position=vec4(float(i%16u)/8.0-1.0,float(i/16u)/8.0-1.0,0.5,1);
+ if(i<64u){
+   gl_PrimitiveTriangleIndicesEXT[i]=uvec3(i,(i+1u)%128u,(i+2u)%128u);
+   gl_MeshPrimitivesEXT[i].gl_Layer=0; gl_MeshPrimitivesEXT[i].gl_ViewportIndex=0;
+   pcol[i]=vec4(float(pl.base),0,1,1);
+ }
+}

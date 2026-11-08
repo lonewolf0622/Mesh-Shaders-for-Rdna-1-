@@ -789,8 +789,9 @@ task_feature_roundtrip(nir_builder *b, task_feature feature)
             const unsigned expected0 = feature == TASK_READ_BACK ? v + grp * 100 + 5 :
                                        feature == TASK_NUM_WORKGROUPS ? groups : 7;
             EXPECT_EQ(fetch.outputs[VARYING_SLOT_VAR0 * 4], expected0);
-            if (has_pp && c == 0)
+            if (has_pp && c == 0) {
                EXPECT_EQ(fetch.outputs[(VARYING_SLOT_VAR0 + 2) * 4], writer * 11 + grp);
+            }
          }
       }
    }

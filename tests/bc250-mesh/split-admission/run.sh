@@ -110,5 +110,9 @@ feat_2d_task|feat_2d_task|t|RADV_BC250_MESH_TASK_IDX=force|0|BC250 TASK IDX: app
 feat_ssbo_task|feat_ssbo_task|t|RADV_BC250_MESH_TASK_IDX=force|0|BC250 TASK IDX: applied
 feat_cull_task|feat_cull_task|t|RADV_BC250_MESH_TASK_IDX=force|0|BC250 TASK IDX: applied
 feat_numwg_task|feat_numwg_task|t|RADV_BC250_MESH_TASK_IDX=force|0|BC250 TASK IDX: applied
+feat_view_task|feat_view_task|t|RADV_BC250_MESH_TASK_IDX=force|0|BC250 TASK IDX: applied
+feat_primid_task|feat_primid_task|t|RADV_BC250_MESH_TASK_IDX=force|0|BC250 TASK IDX: applied
+feat_layer_task|feat_layer_task|t|RADV_BC250_MESH_TASK_IDX=force|0|BC250 TASK IDX: applied
+feat_bary_task|feat_bary_task|t|RADV_BC250_MESH_TASK_IDX=force|0|BC250 TASK IDX: applied
 EOF
 exit $fail

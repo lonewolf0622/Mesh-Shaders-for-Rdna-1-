@@ -32,17 +32,28 @@ slots the shader writes and runs each Mesh workgroup exactly once (in exactly on
 - 2D/3D Mesh workgroups (the pass is a compute shader with the same shape);
 - `gl_CullPrimitiveEXT` (staged in the pass's shared memory; culled primitives become degenerate);
 - `gl_NumWorkGroups` (the record's Mesh grid);
-- storage buffer and image writes and external atomics.
+- storage buffer and image writes and external atomics;
+- multiview: the producer runs once, then the pass chain runs once per view with that view's ViewIndex and
+  draws only that view (a Task shader reading ViewIndex is refused, as on the hybrid route);
+- fragment shaders reading `gl_PrimitiveID` (moved to a free generic slot as a flat primitive attribute),
+  `gl_Layer`/`gl_ViewportIndex` (exported by the stored vertex shader from the provoking vertex) or
+  barycentrics (the stored triangles keep the Mesh corner order).
 
 Reading back Mesh outputs is also handled, but valid SPIR-V never does it (VUID-StandaloneSpirv-MeshEXT-07107).
 
+Indirect Task draws cover the full 4,194,304 Task workgroups: Task index pipelines use larger producer
+chunks (up to 32,768 workgroups, bounded by 32 MiB of records and payloads and by the pass budget), so an
+indirect record has BC250_MAX_TASK_TOTAL / chunk slots (128 to 1024). Each slot carries its pass chain, so an
+indirect draw records about 2.6 K dwords per slot; inactive slots are skipped on the GPU.
+
+`SIMULTANEOUS_USE` command buffers work on one queue: every pass drains earlier work before it rewrites the pool
+and the table sets. Concurrent execution of one command buffer on two queues is not protected.
+
 Limits:
 
-- Indirect Task draws cover 16 producer chunks (65,536 Task workgroups per record). Groups beyond them
-  are not drawn.
-- `SIMULTANEOUS_USE` command buffers and device-generated commands skip these draws, with one warning.
+- Device-generated commands skip these draws, with one warning. A DGC capture records each sequence into a
+  temporary recording; this route's pool and tables would belong to it and be freed while the GPU still uses them.
 - Pipeline statistics do not count the index pass as Mesh invocations.
-- Multiview, and fragment shaders reading PrimitiveID, Layer, Viewport or barycentrics, stay refused.
 
 Checks (all CPU, no GPU execution):
 

@@ -1,0 +1,15 @@
+#version 460
+#extension GL_EXT_mesh_shader : require
+#extension GL_EXT_multiview : require
+// Task index route feature: multiview, the Mesh shader reads gl_ViewIndex (one pass chain per view).
+layout(local_size_x=128) in;
+layout(triangles, max_vertices=128, max_primitives=64) out;
+layout(location=0) perprimitiveEXT flat out vec4 pcol[];
+struct P { uint base; }; taskPayloadSharedEXT P pl;
+void main(){
+ uint i=gl_LocalInvocationIndex;
+ SetMeshOutputsEXT(128,64);
+ float shift=float(gl_ViewIndex)*0.25;
+ gl_MeshVerticesEXT[i].gl_Position=vec4(float(i%16u)/8.0-1.0+shift,float(i/16u)/8.0-1.0,0.5,1);
+ if(i<64u){ gl_PrimitiveTriangleIndicesEXT[i]=uvec3(i,(i+1u)%128u,(i+2u)%128u); pcol[i]=vec4(float(gl_ViewIndex),float(pl.base),1,1); }
+}

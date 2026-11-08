@@ -3995,7 +3995,15 @@ struct bc250_task_slot {
  * per record; inactive chunk slots hold zero records, which are no-op
  * dispatches and count-0 draws. */
 #define BC250_INDIRECT_CHUNKS 1024u
-#define BC250_TASK_IDX_INDIRECT_CHUNKS 16u
+#define BC250_TASK_IDX_MAX_CHUNK 32768u
+
+/* Producer chunk size of a hybrid Task pipeline (0 on pipelines restored from a cached plan, which use the
+ * default). */
+static inline unsigned
+bc250_task_chunk(const struct radv_graphics_pipeline *pipeline)
+{
+   return pipeline->bc250_task_chunk ? pipeline->bc250_task_chunk : BC250_TASK_CHUNK;
+}
 
 static nir_def *
 bc250_pointer(nir_builder *b, unsigned offset)
@@ -4183,9 +4191,12 @@ bc250_lower_application_constants(nir_builder *b, nir_intrinsic_instr *intrin, v
    return true;
 }
 
+/* chunk: producer chunk size (power of two, at most 32768 so one chunk is a single dispatch dimension); the
+ * record is split into BC250_MAX_TASK_TOTAL / chunk slots. */
 static nir_shader *
-bc250_build_indirect_setup(struct radv_device *device)
+bc250_build_indirect_setup_sized(struct radv_device *device, unsigned chunk)
 {
+   const unsigned slots = BC250_MAX_TASK_TOTAL / chunk;
    nir_builder b = nir_builder_init_simple_shader(MESA_SHADER_COMPUTE,
       &device->compiler_info.nir_options[MESA_SHADER_COMPUTE], "bc250_indirect_setup");
    b.shader->info.workgroup_size[0] = 64;
@@ -4248,20 +4259,19 @@ bc250_build_indirect_setup(struct radv_device *device)
    {
       nir_def *k = nir_load_var(&b, kvar);
       /* While-loop exit. */
-      nir_push_if(&b, nir_uge(&b, k, nir_imm_int(&b, BC250_INDIRECT_CHUNKS)));
+      nir_push_if(&b, nir_uge(&b, k, nir_imm_int(&b, slots)));
       nir_jump(&b, nir_jump_break);
       nir_pop_if(&b, NULL);
       /* k < BC250_INDIRECT_CHUNKS and CHUNK is a power of two, so the product
        * fits u32 (max (K_MAX-1)*CHUNK < 2^22). */
-      nir_def *base_k = nir_imul_imm(&b, k, BC250_TASK_CHUNK);
+      nir_def *base_k = nir_imul_imm(&b, k, chunk);
       nir_def *active = nir_iand(&b, valid, nir_ult(&b, nir_u2u64(&b, base_k), total));
       /* n_k = min(CHUNK, total - base_k). The subtraction underflows (wraps to
        * a huge u64) when the chunk is inactive; such chunks are stored zero by
        * the outer select, so only the clamped value matters for active ones. */
       nir_def *rem = nir_isub(&b, total, nir_u2u64(&b, base_k));
-      nir_def *le_chunk = nir_ule_imm(&b, rem, BC250_TASK_CHUNK);
-      nir_def *n = nir_u2u32(&b, nir_bcsel(&b, le_chunk, rem,
-                                           nir_u2u64(&b, nir_imm_int(&b, BC250_TASK_CHUNK))));
+      nir_def *le_chunk = nir_ule_imm(&b, rem, chunk);
+      nir_def *n = nir_u2u32(&b, nir_bcsel(&b, le_chunk, rem, nir_u2u64(&b, nir_imm_int(&b, chunk))));
       nir_store_global(&b, nir_bcsel(&b, active, nir_vec4(&b, n, nir_imm_int(&b, 1), nir_imm_int(&b, 1), n),
                                      zero_record),
          nir_iadd(&b, bc250_pointer(&b, 48), nir_u2u64(&b, nir_imul_imm(&b, k, 16))), .align_mul = 16);
@@ -4271,6 +4281,12 @@ bc250_build_indirect_setup(struct radv_device *device)
    nir_shader_gather_info(b.shader, nir_shader_get_entrypoint(b.shader));
    nir_validate_shader(b.shader, "BC250 indirect setup");
    return b.shader;
+}
+
+static nir_shader *
+bc250_build_indirect_setup(struct radv_device *device)
+{
+   return bc250_build_indirect_setup_sized(device, BC250_TASK_CHUNK);
 }
 
 /* One batched argument rewrite replaces synthetic per-group producers for
@@ -5407,14 +5423,16 @@ bc250_idx_eligible(nir_shader *mesh, nir_shader *fs, bool task, const char **why
    nir_foreach_shader_in_variable(v, fs) {
       if (v->data.per_primitive && v->data.location < VARYING_SLOT_VAR0) { *why = "fragment primitive builtin"; return false; }
    }
-   if (BITSET_TEST(fs->info.system_values_read, SYSTEM_VALUE_PRIMITIVE_ID) ||
-       BITSET_TEST(fs->info.system_values_read, SYSTEM_VALUE_BARYCENTRIC_PERSP_PIXEL) ||
-       fs->info.inputs_read & (VARYING_BIT_PRIMITIVE_ID | VARYING_BIT_LAYER | VARYING_BIT_VIEWPORT)) {
+   /* The Task index route moved PrimitiveID to a primitive attribute (bc250_idx_task_primitive_builtins); Layer,
+    * Viewport and barycentrics come from the vertex pipeline (stored triangles keep the Mesh corner order). */
+   if (!task && (BITSET_TEST(fs->info.system_values_read, SYSTEM_VALUE_PRIMITIVE_ID) ||
+                 BITSET_TEST(fs->info.system_values_read, SYSTEM_VALUE_BARYCENTRIC_PERSP_PIXEL) ||
+                 fs->info.inputs_read & (VARYING_BIT_PRIMITIVE_ID | VARYING_BIT_LAYER | VARYING_BIT_VIEWPORT))) {
       *why = "fragment reads primitive-level data"; return false;
    }
    /* The Task index route stages CullPrimitive and makes culled primitives degenerate. */
    const uint64_t primitive_builtins = BITFIELD64_MASK(VARYING_SLOT_VAR0) & ~VARYING_BIT_PRIMITIVE_INDICES &
-                                       ~(task ? VARYING_BIT_CULL_PRIMITIVE : 0);
+                                       ~(task ? VARYING_BIT_CULL_PRIMITIVE | VARYING_BIT_LAYER | VARYING_BIT_VIEWPORT : 0);
    if (contract.declared_per_primitive_outputs & primitive_builtins) { *why = "primitive builtin output"; return false; }
    if (contract.non_array_output) { *why = "vertex output type"; return false; }
    if (!contract.triangle_index_array) { *why = "no triangle indices"; return false; }
@@ -5452,7 +5470,7 @@ bc250_idx_eligible(nir_shader *mesh, nir_shader *fs, bool task, const char **why
             default: {
                const char *name = nir_intrinsic_infos[in->intrinsic].name;
                if ((strstr(name, "payload") && !(task && in->intrinsic == nir_intrinsic_load_task_payload)) ||
-                   strstr(name, "launch") || strstr(name, "view_index") ||
+                   strstr(name, "launch") || (strstr(name, "view_index") && !task) ||
                    strstr(name, "terminate") || strstr(name, "demote")) {
                   *why = name; return false;
                }
@@ -5733,8 +5751,9 @@ bc250_idx_build_vs(struct radv_device *device, const nir_shader *mesh, const cha
  * Task index route (radv_bc250_task_idx_pipeline_create), which has no Mesh pipeline. */
 static VkResult
 bc250_create_task_producer(struct radv_device *device, struct radv_graphics_pipeline *pipeline, const nir_shader *task,
-                           const struct radv_pipeline_layout *layout, bool synthetic_task)
+                           const struct radv_pipeline_layout *layout, bool synthetic_task, unsigned chunk)
 {
+   pipeline->bc250_task_chunk = chunk;
    nir_shader *producer = nir_shader_clone(NULL, task);
    nir_lower_task_shader_options lower = {
       .payload_to_shared_for_atomics = true,
@@ -5832,7 +5851,7 @@ bc250_create_task_producer(struct radv_device *device, struct radv_graphics_pipe
       result = radv_compute_pipeline_create(radv_device_to_handle(device), device->meta_state.cache,
                                             &info, NULL, &pipeline->bc250_task_pipeline);
       if (result == VK_SUCCESS) {
-         nir_shader *setup = bc250_build_indirect_setup(device);
+         nir_shader *setup = bc250_build_indirect_setup_sized(device, chunk);
          info.stage.module = vk_shader_module_handle_from_nir(setup);
          result = radv_compute_pipeline_create(radv_device_to_handle(device), device->meta_state.cache,
                                                &info, NULL, &pipeline->bc250_setup_pipeline);
@@ -6271,7 +6290,8 @@ radv_bc250_prepare_task(struct radv_device *device,
    pipeline->bc250_payload_stride = MAX2(16, align(MAX2(task->info.task_payload_size,
                                                        mesh->info.task_payload_size), 16));
 
-   VkResult result = bc250_create_task_producer(device, pipeline, task, &gfx_state->layout, synthetic_task);
+   VkResult result = bc250_create_task_producer(device, pipeline, task, &gfx_state->layout, synthetic_task,
+                                                BC250_TASK_CHUNK);
    if (result != VK_SUCCESS)
       return result;
 
@@ -6505,8 +6525,9 @@ bc250_emit_chunks(struct radv_cmd_buffer *cmd_buffer, struct radv_graphics_pipel
                   const struct bc250_constants *constants, uint64_t address,
                   uint32_t full_x, uint32_t full_y, uint32_t full_z, uint64_t total)
 {
-   for (uint64_t base = 0; base < total; base += BC250_TASK_CHUNK) {
-      uint32_t n = (uint32_t)MIN2(total - base, (uint64_t)BC250_TASK_CHUNK);
+   const unsigned chunk = bc250_task_chunk(pipeline);
+   for (uint64_t base = 0; base < total; base += chunk) {
+      uint32_t n = (uint32_t)MIN2(total - base, (uint64_t)chunk);
       bc250_emit_chunk(cmd_buffer, pipeline, constants, address, base, n);
    }
 }
@@ -6547,7 +6568,7 @@ bc250_emit_indirect_chunk(struct radv_cmd_buffer *cmd_buffer, struct radv_graphi
 
    uint64_t sub_record = constants->compute_args + (uint64_t)k * 16;
    struct bc250_constants cc = *constants;
-   cc.chunk_base = (uint32_t)((uint64_t)k * BC250_TASK_CHUNK);
+   cc.chunk_base = (uint32_t)((uint64_t)k * bc250_task_chunk(pipeline));
 
    radv_meta_begin(cmd_buffer);
    radv_meta_bind_compute_pipeline(cmd_buffer, pipeline->bc250_task_pipeline);
@@ -6567,7 +6588,7 @@ bc250_emit_indirect_chunk(struct radv_cmd_buffer *cmd_buffer, struct radv_graphi
    }
    if (pipeline->bc250_task_idx) {
       cmd_buffer->bc250_task_cond_region = conditional_buf != NULL;
-      bc250_task_idx_consume(cmd_buffer, pipeline, &cc, address, BC250_TASK_CHUNK, sub_record + 12);
+      bc250_task_idx_consume(cmd_buffer, pipeline, &cc, address, bc250_task_chunk(pipeline), sub_record + 12);
       cmd_buffer->bc250_task_cond_region = false;
    } else {
       uint8_t saved[sizeof(cc)];
@@ -6831,7 +6852,7 @@ bc250_draw_task(struct radv_cmd_buffer *cmd_buffer, uint32_t x, uint32_t y, uint
          vk_command_buffer_set_error(&cmd_buffer->vk, VK_ERROR_FEATURE_NOT_PRESENT);
          return;
       }
-      if (total > BC250_TASK_CHUNK)
+      if (total > bc250_task_chunk(pipeline))
          chunked = true;
    }
 
@@ -6840,7 +6861,8 @@ bc250_draw_task(struct radv_cmd_buffer *cmd_buffer, uint32_t x, uint32_t y, uint
     * table (BC250_INDIRECT_CHUNKS entries). Reusing it across chunks and
     * indirect records bounds memory by BC250_TASK_CHUNK rather than by the
     * dispatch total or indirect drawCount. */
-   unsigned count = BC250_TASK_CHUNK;
+   unsigned count = bc250_task_chunk(pipeline);
+   const unsigned indirect_slots = BC250_MAX_TASK_TOTAL / bc250_task_chunk(pipeline);
    if (!indirect_va && !chunked)
       count = (unsigned)total;
    unsigned payload_offset = align(count * 12, 256);
@@ -6865,7 +6887,7 @@ bc250_draw_task(struct radv_cmd_buffer *cmd_buffer, uint32_t x, uint32_t y, uint
     * the setup shader's sub-record table after it. */
    unsigned slots_base = app_offset + MAX_PUSH_CONSTANTS_SIZE;
    unsigned bytes = slots_base + (unsigned)sizeof(struct bc250_task_slot) +
-      (indirect_va ? BC250_INDIRECT_CHUNKS * 16u : 0);
+      (indirect_va ? indirect_slots * 16u : 0);
    uint64_t address = shared_address ? *shared_address : 0;
    void *mapped = NULL;
    if (!address) {
@@ -6977,10 +6999,8 @@ bc250_draw_task(struct radv_cmd_buffer *cmd_buffer, uint32_t x, uint32_t y, uint
                     cs->cdw - conditional_start - 5);
          bc250_invalidate_after_task_tail(cmd_buffer);
       } else {
-         /* RADV_BC250_MESH_TASK_IDX: every chunk slot carries several index passes, so an indirect record covers
-          * BC250_TASK_IDX_INDIRECT_CHUNKS chunks (65,536 Task workgroups); groups beyond them are not drawn. */
-         const unsigned slots = pipeline->bc250_task_idx ? BC250_TASK_IDX_INDIRECT_CHUNKS : BC250_INDIRECT_CHUNKS;
-         for (unsigned k = 1; k < slots; k++) {
+         /* RADV_BC250_MESH_TASK_IDX pipelines use larger chunks (bc250_task_chunk), so fewer slots. */
+         for (unsigned k = 1; k < indirect_slots; k++) {
             bc250_emit_indirect_chunk(cmd_buffer, pipeline, &constants, address, k, skip_suffix);
             if (vk_command_buffer_has_error(&cmd_buffer->vk))
                return;
@@ -7749,6 +7769,80 @@ radv_bc250_idx_create(struct radv_device *device, struct radv_graphics_pipeline 
    bc250_idx_create(device, pipeline, pCreateInfo, NULL, NULL);
 }
 
+/* Task index route: per-primitive built-ins the fragment stage reads, in a vertex pipeline.
+ * - PrimitiveID moves to the highest free generic slot as a flat primitive attribute (stored and fetched like
+ *   the others); the fragment shader reads that slot instead (0 when the Mesh shader never writes it).
+ * - Layer and Viewport stay Mesh primitive outputs: the stored vertex shader exports them from the provoking
+ *   vertex, which is where a vertex pipeline takes them from; the fragment inputs are ordinary ones. */
+static void
+bc250_idx_task_primitive_builtins(nir_shader *mesh, nir_shader *frag)
+{
+   uint64_t used = 0;
+   nir_foreach_shader_out_variable (v, mesh)
+      used |= BITFIELD64_BIT(v->data.location);
+   nir_foreach_shader_in_variable (v, frag)
+      used |= BITFIELD64_BIT(v->data.location);
+   unsigned slot = 0;
+   for (unsigned s = VARYING_SLOT_VAR31; s >= VARYING_SLOT_VAR0 && !slot; s--) {
+      if (!(used & BITFIELD64_BIT(s)))
+         slot = s;
+   }
+   nir_variable *written = NULL;
+   nir_foreach_shader_out_variable (v, mesh) {
+      if (v->data.location == VARYING_SLOT_PRIMITIVE_ID && v->data.per_primitive)
+         written = v;
+   }
+   if (written && slot)
+      written->data.location = slot;
+   nir_function_impl *impl = nir_shader_get_entrypoint(frag);
+   nir_variable *input = NULL;
+   nir_foreach_shader_in_variable (v, frag) {
+      if (v->data.location == VARYING_SLOT_PRIMITIVE_ID) {
+         input = v;
+      } else if (v->data.location == VARYING_SLOT_LAYER || v->data.location == VARYING_SLOT_VIEWPORT) {
+         v->data.per_primitive = false;
+         v->data.interpolation = INTERP_MODE_FLAT;
+      }
+   }
+   if (input && written && slot) {
+      input->data.location = slot;
+      input->data.per_primitive = true; /* radv_bc250_pp_direct_fs_inputs makes it flat */
+   }
+   nir_builder b = nir_builder_create(impl);
+   nir_variable *sysval_input = NULL;
+   nir_foreach_block (block, impl) {
+      nir_foreach_instr_safe (instr, block) {
+         if (instr->type != nir_instr_type_intrinsic)
+            continue;
+         nir_intrinsic_instr *in = nir_instr_as_intrinsic(instr);
+         const bool sysval = in->intrinsic == nir_intrinsic_load_primitive_id;
+         const bool unbacked = in->intrinsic == nir_intrinsic_load_deref && input && !(written && slot) &&
+                               nir_deref_instr_get_variable(nir_src_as_deref(in->src[0])) == input;
+         if (!sysval && !unbacked)
+            continue;
+         b.cursor = nir_before_instr(instr);
+         nir_def *value;
+         if (written && slot) {
+            if (!sysval_input) {
+               sysval_input = nir_variable_create(frag, nir_var_shader_in, glsl_uint_type(), "bc250_primitive_id");
+               sysval_input->data.location = slot;
+               sysval_input->data.per_primitive = true;
+               sysval_input->data.interpolation = INTERP_MODE_FLAT;
+            }
+            value = nir_load_var(&b, sysval_input);
+         } else {
+            value = nir_imm_int(&b, 0);
+         }
+         nir_def_rewrite_uses(&in->def, nir_u2uN(&b, value, in->def.bit_size));
+         nir_instr_remove(instr);
+      }
+   }
+   nir_progress(true, impl, nir_metadata_none);
+   NIR_PASS(_, frag, nir_remove_dead_derefs);
+   nir_shader_gather_info(mesh, nir_shader_get_entrypoint(mesh));
+   nir_shader_gather_info(frag, impl);
+}
+
 /* task: NULL for the ordinary index route beside a Mesh route. Otherwise the Task index route
  * (radv_bc250_task_idx_pipeline_create): the Task stage is accepted, the route is always stored and
  * indirect, the payload stride is published in pipeline->bc250_payload_stride, and the vertex/fragment
@@ -7783,7 +7877,9 @@ bc250_idx_create(struct radv_device *device, struct radv_graphics_pipeline *pipe
       return;
    /* The index route compiles its shaders for view 0 only. */
    const VkPipelineRenderingCreateInfo *rendering = vk_get_pipeline_rendering_create_info(pCreateInfo);
-   if (rendering && rendering->viewMask) {
+   /* The Task index route runs the pass once per view (bc250_task_idx_consume). */
+   const bool multiview = rendering && rendering->viewMask;
+   if (multiview && !task) {
       if (trace)
          fprintf(stderr, "BC250 MESH IDXPASS: declined (multiview)\n");
       return;
@@ -7796,7 +7892,7 @@ bc250_idx_create(struct radv_device *device, struct radv_graphics_pipeline *pipe
       radv_pipeline_get_shader_key(&device->compiler_info, fs_info, pipeline->base.create_flags, pCreateInfo->pNext);
    radv_pipeline_stage_init(pipeline->base.create_flags, ms_info, layout, &ms_key, &ms);
    radv_pipeline_stage_init(pipeline->base.create_flags, fs_info, layout, &fs_key, &fs);
-   struct radv_spirv_to_nir_options options = {.lower_view_index_to_zero = true};
+   struct radv_spirv_to_nir_options options = {.lower_view_index_to_zero = !multiview};
    nir_shader *mesh = radv_shader_spirv_to_nir_cached(&device->compiler_info, NULL, &ms, &options, false);
    nir_shader *frag = radv_shader_spirv_to_nir_cached(&device->compiler_info, NULL, &fs, &options, false);
    nir_shader *cs = NULL, *vs = NULL;
@@ -7810,6 +7906,8 @@ bc250_idx_create(struct radv_device *device, struct radv_graphics_pipeline *pipe
       NIR_PASS(_, mesh, nir_split_var_copies);
       NIR_PASS(_, mesh, nir_lower_var_copies);
    }
+   if (task && mesh && frag)
+      bc250_idx_task_primitive_builtins(mesh, frag);
    if (!mesh || !frag || !bc250_idx_eligible(mesh, frag, task != NULL, &why)) {
       if (trace)
          fprintf(stderr, "BC250 MESH IDXPASS: declined (%s)\n", why ? why : "no NIR");
@@ -8098,10 +8196,19 @@ radv_bc250_task_idx_pipeline_create(struct radv_device *device, const VkGraphics
          fprintf(stderr, "BC250 TASK IDX: declined (stage layout mapping)\n");
       return VK_ERROR_FEATURE_NOT_PRESENT;
    }
-   struct radv_spirv_to_nir_options options = {.lower_view_index_to_zero = true};
+   const VkPipelineRenderingCreateInfo *rendering = vk_get_pipeline_rendering_create_info(pCreateInfo);
+   struct radv_spirv_to_nir_options options = {.lower_view_index_to_zero = !(rendering && rendering->viewMask)};
    nir_shader *task = radv_shader_spirv_to_nir_cached(&device->compiler_info, NULL, &ts, &options, false);
    if (!task)
       return VK_ERROR_FEATURE_NOT_PRESENT;
+   /* The producer runs once for all views (as on the hybrid route): a Task shader reading ViewIndex is refused. */
+   nir_shader_gather_info(task, nir_shader_get_entrypoint(task));
+   if (BITSET_TEST(task->info.system_values_read, SYSTEM_VALUE_VIEW_INDEX)) {
+      if (trace)
+         fprintf(stderr, "BC250 TASK IDX: declined (multiview Task shader reads ViewIndex)\n");
+      ralloc_free(task);
+      return VK_ERROR_FEATURE_NOT_PRESENT;
+   }
    /* As the hybrid producer: application constants from the copied block, DrawID the draw's. */
    NIR_PASS(_, task, nir_shader_intrinsics_pass, bc250_lower_application_constants, nir_metadata_control_flow, NULL);
 
@@ -8132,7 +8239,17 @@ radv_bc250_task_idx_pipeline_create(struct radv_device *device, const VkGraphics
    /* Passes after the first are skipped on the GPU when nothing overflowed (about 170 dwords each, no drain),
     * so default to the maximum. RADV_BC250_MESH_TASK_IDX_PASSES overrides it. */
    pipeline->bc250_task_idx_passes = device->bc250_env.task_idx_passes ? device->bc250_env.task_idx_passes : 16;
-   VkResult result = bc250_create_task_producer(device, pipeline, task, layout, false);
+   /* Larger producer chunks need fewer indirect chunk slots (each carries its index passes): the largest power
+    * of two within 32 MiB of records and payloads, and within the passes for one Mesh workgroup per Task
+    * workgroup; between BC250_TASK_CHUNK and BC250_TASK_IDX_MAX_CHUNK. */
+   const uint64_t group_bytes = (uint64_t)pipeline->bc250_idx_primitives * 12 + pipeline->bc250_idx_output_bytes;
+   const uint64_t by_scratch = (32ull << 20) / (12 + pipeline->bc250_payload_stride);
+   const uint64_t by_passes = (uint64_t)pipeline->bc250_task_idx_passes * (device->bc250_env.idx_pool_bytes - 256) /
+                              MAX2(group_bytes, 1);
+   unsigned chunk = BC250_TASK_CHUNK;
+   while (chunk * 2 <= BC250_TASK_IDX_MAX_CHUNK && chunk * 2 <= by_scratch && chunk * 2 <= by_passes)
+      chunk *= 2;
+   VkResult result = bc250_create_task_producer(device, pipeline, task, layout, false, chunk);
    ralloc_free(task);
    if (result != VK_SUCCESS) {
       if (trace)
@@ -8141,9 +8258,9 @@ radv_bc250_task_idx_pipeline_create(struct radv_device *device, const VkGraphics
       return VK_ERROR_FEATURE_NOT_PRESENT;
    }
    if (trace)
-      fprintf(stderr, "BC250 TASK IDX: applied V=%u P=%u payload_stride=%u output_bytes=%u passes=%u\n",
+      fprintf(stderr, "BC250 TASK IDX: applied V=%u P=%u payload_stride=%u output_bytes=%u passes=%u chunk=%u\n",
               pipeline->bc250_idx_vertices, pipeline->bc250_idx_primitives, pipeline->bc250_payload_stride,
-              pipeline->bc250_idx_output_bytes, pipeline->bc250_task_idx_passes);
+              pipeline->bc250_idx_output_bytes, pipeline->bc250_task_idx_passes, bc250_task_chunk(pipeline));
    *pPipeline = route.bc250_idx_gfx;
    return VK_SUCCESS;
 }
@@ -8960,7 +9077,7 @@ bc250_idx_task_table_bytes(uint32_t max_count)
 static bool
 bc250_idx_task_pass(struct radv_cmd_buffer *cmd_buffer, struct radv_graphics_pipeline *pipeline, uint64_t records,
                     uint32_t max_count, uint64_t count_va, uint64_t payload, uint32_t draw_id, unsigned slot,
-                    uint64_t *mesh_out, uint64_t *table_out)
+                    unsigned view, uint32_t draw_view_mask, uint64_t *mesh_out, uint64_t *table_out)
 {
    struct radv_device *device = radv_cmd_buffer_device(cmd_buffer);
    if (!cmd_buffer->bc250_idx_pool_bo) {
@@ -8984,9 +9101,10 @@ bc250_idx_task_pass(struct radv_cmd_buffer *cmd_buffer, struct radv_graphics_pip
    const uint64_t pool = cmd_buffer->bc250_idx_pool;
    /* Every pass drains the previous readers first (the caller), so two table sets sized for a full producer
     * chunk serve all passes of the command buffer: pass p reads set (p - 1) & 1 and writes set p & 1. */
-   assert(max_count <= BC250_TASK_CHUNK);
+   assert(max_count <= BC250_TASK_IDX_MAX_CHUNK);
    if (!cmd_buffer->bc250_task_idx_tables[slot] &&
-       !bc250_idx_alloc(cmd_buffer, bc250_idx_task_table_bytes(BC250_TASK_CHUNK), &cmd_buffer->bc250_task_idx_tables[slot]))
+       !bc250_idx_alloc(cmd_buffer, bc250_idx_task_table_bytes(BC250_TASK_IDX_MAX_CHUNK),
+                        &cmd_buffer->bc250_task_idx_tables[slot]))
       return false;
    const uint64_t table = cmd_buffer->bc250_task_idx_tables[slot];
    const uint64_t prefix_bytes = ALIGN_POT(32 + (uint64_t)(max_count + 1) * 4, 16);
@@ -9007,6 +9125,7 @@ bc250_idx_task_pass(struct radv_cmd_buffer *cmd_buffer, struct radv_graphics_pip
       .xyz = table, .payload = pool + 256, .application_draw_id = draw_id,
       .application_constants = radv_cmd_buffer_upload_va(cmd_buffer) + coffset,
       .input = dims, .input_count = draws, .compute_args = payload,
+      .split_piece = view, /* ViewIndex of the pass (radv_bc250_idx_build_task_cs) */
    };
    cmd_buffer->bc250_idx_pool_used = true;
    cmd_buffer->bc250_diag_idx_indirect++;
@@ -9032,11 +9151,16 @@ bc250_idx_task_pass(struct radv_cmd_buffer *cmd_buffer, struct radv_graphics_pip
    const VkDrawIndirectCount2InfoKHR draw = {.sType = VK_STRUCTURE_TYPE_DRAW_INDIRECT_COUNT_2_INFO_KHR,
       .addressRange = {.address = draws, .size = (uint64_t)max_count * 20, .stride = 20},
       .countAddressRange = {.address = table, .size = 4}, .maxDrawCount = max_count};
+   /* Multiview: this pass's outputs belong to one view; draw only that view. */
+   const uint32_t view_mask = cmd_buffer->state.render.view_mask;
+   if (draw_view_mask)
+      cmd_buffer->state.render.view_mask = draw_view_mask;
    radv_CmdDrawIndexedIndirectCount2KHR(radv_cmd_buffer_to_handle(cmd_buffer), &draw);
+   cmd_buffer->state.render.view_mask = view_mask;
    bc250_idx_draw_end(cmd_buffer, &saved);
    radv_bc250_idx_restore(cmd_buffer);
    if (device->bc250_env.idx_trace)
-      fprintf(stderr, "BC250 TASK IDX: pass records=%u slot=%u\n", max_count, slot);
+      fprintf(stderr, "BC250 TASK IDX: pass records=%u slot=%u view=%u\n", max_count, slot, view);
    *mesh_out = mesh;
    *table_out = table;
    return true;
@@ -9059,69 +9183,77 @@ bc250_task_idx_consume(struct radv_cmd_buffer *cmd_buffer, struct radv_graphics_
 {
    if (!max_count)
       return;
-   /* The pool and tables are per recording: a concurrent execution would overwrite them in use. */
-   if ((cmd_buffer->usage_flags & VK_COMMAND_BUFFER_USAGE_SIMULTANEOUS_USE_BIT) || cmd_buffer->bc250_dgc_upload_va ||
-       max_count > BC250_TASK_CHUNK) {
-      bc250_task_idx_skip("simultaneous use or generated commands");
+   /* Device-generated commands capture each sequence into a temporary recording: this route's pool and tables
+    * would belong to it and be freed while the GPU still uses them. SIMULTANEOUS_USE is fine on one queue: every
+    * pass drains earlier work before it rewrites the pool and the table sets (concurrent execution on two
+    * queues is not protected). */
+   if (cmd_buffer->bc250_dgc_upload_va || max_count > BC250_TASK_IDX_MAX_CHUNK) {
+      bc250_task_idx_skip("device-generated commands");
       return;
    }
    struct radv_device *device = radv_cmd_buffer_device(cmd_buffer);
    const struct radv_physical_device *pdev = radv_device_physical(device);
-   uint64_t rec = records, count = count_va;
-   const unsigned passes = pipeline->bc250_task_idx_passes;
-   /* Pass 0 always runs. Pass p > 0 runs only when pass p - 1 left overflow (its 0/1 flag at table + 24), in
-    * nested COND_EXEC regions: a skipped pass also skips every later one, so no pass reads a flag that this
-    * call did not write (the table sets are reused). Each region holds the drain and PFP sync its predicate
-    * needs, so skipped passes cost no drain. */
-   uint32_t *region_buf = NULL;
-   unsigned region_start[16], regions = 0;
-   for (unsigned pass = 0; pass < passes; pass++) {
-      if (pass) {
-         /* Publish pass p - 1's flag to the CP, inside pass p - 1's region. */
-         cmd_buffer->state.flush_bits |= RADV_CMD_FLAG_CS_PARTIAL_FLUSH | RADV_CMD_FLAG_VS_PARTIAL_FLUSH |
-                                         RADV_CMD_FLAG_PS_PARTIAL_FLUSH | RADV_CMD_FLAG_WB_L2 | RADV_CMD_FLAG_INV_L2;
-         radv_emit_cache_flush(cmd_buffer);
-         ac_emit_cp_pfp_sync_me(cmd_buffer->cs->b, false);
-         struct ac_cmdbuf *cs = cmd_buffer->cs->b;
-         if (!region_buf) {
-            /* Inside an indirect chunk's region its reservation must cover these regions too (it checks). */
-            if (!cmd_buffer->bc250_task_cond_region)
-               radeon_check_space(device->ws, cs, 16384);
-            region_buf = cs->buf;
+   /* Multiview: the producer ran once; the pass chain runs once per view with that view's ViewIndex, each
+    * drawing only into its view. */
+   const uint32_t view_mask = cmd_buffer->state.render.view_mask;
+   u_foreach_bit (view, view_mask ? view_mask : 1) {
+      const uint32_t draw_view_mask = view_mask ? BITFIELD_BIT(view) : 0;
+      uint64_t rec = records, count = count_va;
+      const unsigned passes = pipeline->bc250_task_idx_passes;
+      /* Pass 0 always runs. Pass p > 0 runs only when pass p - 1 left overflow (its 0/1 flag at table + 24), in
+       * nested COND_EXEC regions: a skipped pass also skips every later one, so no pass reads a flag that this
+       * call did not write (the table sets are reused). Each region holds the drain and PFP sync its predicate
+       * needs, so skipped passes cost no drain. */
+      uint32_t *region_buf = NULL;
+      unsigned region_start[16], regions = 0;
+      for (unsigned pass = 0; pass < passes; pass++) {
+         if (pass) {
+            /* Publish pass p - 1's flag to the CP, inside pass p - 1's region. */
+            cmd_buffer->state.flush_bits |= RADV_CMD_FLAG_CS_PARTIAL_FLUSH | RADV_CMD_FLAG_VS_PARTIAL_FLUSH |
+                                            RADV_CMD_FLAG_PS_PARTIAL_FLUSH | RADV_CMD_FLAG_WB_L2 | RADV_CMD_FLAG_INV_L2;
+            radv_emit_cache_flush(cmd_buffer);
+            ac_emit_cp_pfp_sync_me(cmd_buffer->cs->b, false);
+            struct ac_cmdbuf *cs = cmd_buffer->cs->b;
+            if (!region_buf) {
+               /* Inside an indirect chunk's region its reservation must cover these regions too (it checks). */
+               if (!cmd_buffer->bc250_task_cond_region)
+                  radeon_check_space(device->ws, cs, 16384);
+               region_buf = cs->buf;
+            }
+            region_start[regions++] = cs->cdw;
+            ac_emit_cp_cond_exec(cs, pdev->info.gfx_level, count - 20 + 24, 0);
          }
-         region_start[regions++] = cs->cdw;
-         ac_emit_cp_cond_exec(cs, pdev->info.gfx_level, count - 20 + 24, 0);
-      }
-      /* Earlier draws read the pool and the table set this pass restarts. */
-      cmd_buffer->state.flush_bits |= RADV_CMD_FLAG_VS_PARTIAL_FLUSH | RADV_CMD_FLAG_PS_PARTIAL_FLUSH |
-                                      RADV_CMD_FLAG_CS_PARTIAL_FLUSH | RADV_CMD_FLAG_INV_VCACHE |
-                                      RADV_CMD_FLAG_INV_SCACHE;
-      uint64_t mesh, table;
-      if (!bc250_idx_task_pass(cmd_buffer, pipeline, rec, max_count, count, cc->payload, cc->application_draw_id,
-                               pass & 1, &mesh, &table)) {
-         if (regions) {
-            vk_command_buffer_set_error(&cmd_buffer->vk, VK_ERROR_OUT_OF_DEVICE_MEMORY);
+         /* Earlier draws read the pool and the table set this pass restarts. */
+         cmd_buffer->state.flush_bits |= RADV_CMD_FLAG_VS_PARTIAL_FLUSH | RADV_CMD_FLAG_PS_PARTIAL_FLUSH |
+                                         RADV_CMD_FLAG_CS_PARTIAL_FLUSH | RADV_CMD_FLAG_INV_VCACHE |
+                                         RADV_CMD_FLAG_INV_SCACHE;
+         uint64_t mesh, table;
+         if (!bc250_idx_task_pass(cmd_buffer, pipeline, rec, max_count, count, cc->payload, cc->application_draw_id,
+                                  pass & 1, view, draw_view_mask, &mesh, &table)) {
+            if (regions) {
+               vk_command_buffer_set_error(&cmd_buffer->vk, VK_ERROR_OUT_OF_DEVICE_MEMORY);
+               return;
+            }
+            bc250_task_idx_skip("index storage unavailable");
             return;
          }
-         bc250_task_idx_skip("index storage unavailable");
-         return;
+         rec = mesh;
+         count = table + 20;
       }
-      rec = mesh;
-      count = table + 20;
-   }
-   if (regions) {
-      struct ac_cmdbuf *cs = cmd_buffer->cs->b;
-      /* A region must not span IB chains (all of them were reserved at once). */
-      if (cs->buf != region_buf || cs->cdw - region_start[0] - 5 >= 16384) {
-         vk_command_buffer_set_error(&cmd_buffer->vk, VK_ERROR_UNKNOWN);
-         return;
+      if (regions) {
+         struct ac_cmdbuf *cs = cmd_buffer->cs->b;
+         /* A region must not span IB chains (all of them were reserved at once). */
+         if (cs->buf != region_buf || cs->cdw - region_start[0] - 5 >= 16384) {
+            vk_command_buffer_set_error(&cmd_buffer->vk, VK_ERROR_UNKNOWN);
+            return;
+         }
+         for (unsigned r = 0; r < regions; r++)
+            region_buf[region_start[r] + 4] = cs->cdw - region_start[r] - 5;
+         if (device->bc250_env.idx_trace)
+            fprintf(stderr, "BC250 TASK IDX: conditional passes=%u dwords=%u\n", regions, cs->cdw - region_start[0] - 5);
+         /* The GPU may have skipped state the CPU recorded as emitted. */
+         bc250_invalidate_after_task_tail(cmd_buffer);
       }
-      for (unsigned r = 0; r < regions; r++)
-         region_buf[region_start[r] + 4] = cs->cdw - region_start[r] - 5;
-      if (device->bc250_env.idx_trace)
-         fprintf(stderr, "BC250 TASK IDX: conditional passes=%u dwords=%u\n", regions, cs->cdw - region_start[0] - 5);
-      /* The GPU may have skipped state the CPU recorded as emitted. */
-      bc250_invalidate_after_task_tail(cmd_buffer);
    }
 }
 

@@ -283,6 +283,14 @@ bc250_idx_lower_task_payload(nir_shader *cs, nir_variable *draw_var, unsigned pa
                                                      nir_var_mem_global);
             continue;
          }
+         /* Multiview: the pass's view (constants.split_piece, bc250_task_idx_consume). */
+         if (in->intrinsic == nir_intrinsic_load_view_index) {
+            b.cursor = nir_before_instr(instr);
+            nir_def_rewrite_uses(&in->def, nir_load_push_constant(&b, 1, 32, nir_imm_int(&b, 68), .base = 0,
+                                                                   .range = RADV_BC250_IDX_CONSTANT_SIZE));
+            nir_instr_remove(instr);
+            continue;
+         }
          if (in->intrinsic != nir_intrinsic_load_task_payload)
             continue;
          b.cursor = nir_before_instr(instr);
