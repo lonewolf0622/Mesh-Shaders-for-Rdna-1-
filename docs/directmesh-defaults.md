@@ -74,11 +74,10 @@ The fork-safety update (no environment writes, per-device switches, Navi 14
 excluded, RDNA 1 VRS/ray tracing exposure) passed 113 unit tests, 96 activation and
 recording checks (on BC-250, 19 automatic recordings byte-identical in shaders and
 command words to the released `975ec91` driver with its explicit preset) and 69
-extended recordings. CPU evidence: `/home/deck/mesh-test/directmesh-fork-safety-evidence/`.
+extended recordings.
 
 Task + Mesh pipelines with no protected Mesh route can run as the opt-in Task index route
 (`RADV_BC250_MESH_TASK_IDX=1`, `tests/bc250-mesh/task-idx/README.md`). Shared atomics are admitted in
 the Mesh split when every piece slices the same primitives (`tests/bc250-mesh/split-admission/README.md`).
 
-Reproduction is in `tests/bc250-mesh/directmesh-defaults/README.md`. CPU evidence:
-`/home/deck/mesh-test/directmesh-v131-rdna-evidence/`.
+Reproduction is in `tests/bc250-mesh/directmesh-defaults/README.md`.
