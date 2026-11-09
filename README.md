@@ -140,8 +140,8 @@ The BC-250 can lock up hard on a GPU hang. If you want to report one:
   last resort, is refused at pipeline creation. It is never drawn on the unprotected raw route. Split Mesh shaders
   that write images run those writes once, in the first piece.
 - **Task index route (v1.4):** a Task + Mesh pipeline that no Mesh route can take runs the Task stage as a compute
-  producer and the Mesh stage as a compute pass that stores its outputs; an ordinary vertex pipeline draws them. Since
-  v1.4.1 Mesh-only pipelines take it too, behind a built-in Task stage that passes on the workgroup IDs. It
+  producer and the Mesh stage as a compute pass that stores its outputs; an ordinary vertex pipeline draws them. (In the
+  withdrawn v1.4.1, Mesh-only pipelines took it too.) It
   handles large shared memory, shared atomics, primitive compaction, `gl_CullPrimitiveEXT`, multiview, fragment
   `gl_PrimitiveID`, `gl_Layer`, `gl_ViewportIndex` and barycentrics, 2D/3D workgroups and storage writes. It is slower
   than the Mesh route and only used when no Mesh route fits.
@@ -194,7 +194,8 @@ shaders, and Control was played again with the renumbered export.
 
 ## Version history
 
-- **v1.4.1:** Mesh-only pipelines that no Mesh route can take (for example 13 KB of shared memory with subgroup
+- **v1.4.1 (withdrawn):** caused washed-out frames, very high memory use and GPU hangs on a BC-250; use v1.4. It ran
+  Mesh-only pipelines that no Mesh route can take (for example 13 KB of shared memory with subgroup
   ballot or storage writes) run on the Task index route instead of being refused, so their objects are drawn. The
   route's storage budget is 1 GiB of GTT on the BC-250 instead of 128 MiB: with several command buffers in flight the
   old budget ran out and draws were skipped, which showed as flickering frames. Mesh shaders with an explicit
