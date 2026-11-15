@@ -386,6 +386,19 @@ bc250_dgc_capture(struct radv_cmd_buffer *owner, const struct radv_cmd_buffer *s
    cmd->bc250_idx_pool_used = cmd->bc250_idx_drawing = false;
    /* The shallow copy must not touch the owner's task tails; a capture keeps its own. */
    util_dynarray_init(&cmd->bc250_task_tails, NULL);
+   cmd->bc250_task_scratch_bo = NULL;
+   cmd->bc250_task_scratch_size = 0;
+   cmd->bc250_task_scratch_next_size = 0;
+   cmd->bc250_task_scratch_cleared = false;
+   cmd->bc250_task_scratch_used = false;
+   cmd->bc250_task_app_consts_valid = false;
+   cmd->bc250_inherit_descriptors = false;
+   cmd->bc250_fixed_upload = 0;
+   util_dynarray_init(&cmd->bc250_task_tail_pool, NULL);
+   cmd->bc250_task_tail_pool_used = 0;
+   cmd->bc250_task_tail_clock = 0;
+   cmd->bc250_task_reset_seq = 1;
+   memset(cmd->bc250_task_tail_cache, 0, sizeof(cmd->bc250_task_tail_cache));
    cmd->bc250_dgc_tail = NULL;
    cmd->bc250_dgc_tail_va = shape->task && device->compiler_info.bc250x.task_tail ?
       info->preprocessAddress + (uint64_t)seq * shape->stride + shape->template_offset + BC250_DGC_TAIL_OFFSET : 0;

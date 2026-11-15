@@ -31,6 +31,7 @@ static const struct radv_directmesh_setting radv_directmesh_settings[] = {
    {"RADV_BC250_EXPOSE_FAST_BINDING", "1"}, {"RADV_BC250_SUBMIT_KNOWN_SIGNALS", "1"},
    {"RADV_BC250_LOCAL_BOS", "1"}, {"RADV_BC250_KEEP_IB_KB", "640"},
    {"RADV_BC250_PERF_PIECE_PRIMS", "64"}, {"RADV_BC250_SCRATCH_REUSE", "1"},
+   {"RADV_BC250_TASK_PERSIST", "1"},
    {"RADV_BC250_MESH_DIRECT_READ", "full"}, {"RADV_BC250_MESH_AUTOCULL", "1"},
    {"RADV_BC250_MESH_AUTOCULL_WIDE", "1"},
    /* Direct Mesh path. */

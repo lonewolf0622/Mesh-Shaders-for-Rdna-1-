@@ -142,6 +142,7 @@ struct radv_graphics_pipeline {
    VkPipeline bc250_setup_pipeline;
    bool bc250_shared_setup; /* Setup pipeline and layout owned by the device meta cache. */
    VkPipelineLayout bc250_task_layout;
+   uint64_t bc250_tail_id;
    /* RADV_BC250_MESH_IDXPASS: index-pass compute pipeline (+ its layout) and the indexed-draw pipeline. */
    VkPipeline bc250_idx_cs;
    VkPipeline bc250_idx_gfx;

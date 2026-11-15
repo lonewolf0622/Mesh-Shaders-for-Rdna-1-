@@ -502,6 +502,20 @@ struct radv_cmd_buffer_upload {
    struct list_head list;
 };
 
+#define RADV_BC250_TASK_TAIL_CACHE_SIZE 16
+
+struct radv_bc250_task_tail_entry {
+   uint64_t pipeline_id;
+   uint64_t scratch_va;
+   uint32_t view_mask;
+   uint8_t opt_ready;
+   uint32_t last_use;
+   uint32_t used_epoch;
+   struct radv_cmd_stream *stream;
+   struct radeon_winsys_bo *const_bo;
+   struct radv_shader *shaders[3];
+};
+
 struct radv_cmd_stream {
    struct ac_cmdbuf *b;
 
@@ -635,6 +649,21 @@ struct radv_cmd_buffer {
    uint32_t *bc250_split_batch;
    /* RADV_BC250_TASK_TAIL: side streams holding the shared chunk slots 1..1023 (struct radv_cmd_stream *). */
    struct util_dynarray bc250_task_tails;
+   /* RADV_BC250_TASK_PERSIST: persistent hybrid-Task scratch and cached task_tail IB2s. */
+   struct radeon_winsys_bo *bc250_task_scratch_bo;
+   uint64_t bc250_task_scratch_size;
+   uint64_t bc250_task_scratch_next_size;
+   bool bc250_task_scratch_cleared;
+   bool bc250_task_scratch_used;
+   bool bc250_task_app_consts_valid;
+   bool bc250_inherit_descriptors;
+   uint8_t bc250_fixed_upload;
+   uint8_t bc250_task_app_consts[MAX_PUSH_CONSTANTS_SIZE];
+   struct util_dynarray bc250_task_tail_pool;
+   uint32_t bc250_task_tail_pool_used;
+   uint32_t bc250_task_tail_clock;
+   uint32_t bc250_task_reset_seq;
+   struct radv_bc250_task_tail_entry bc250_task_tail_cache[RADV_BC250_TASK_TAIL_CACHE_SIZE];
    uint64_t bc250_split_batch_va;
    uint32_t bc250_split_batch_used;
 

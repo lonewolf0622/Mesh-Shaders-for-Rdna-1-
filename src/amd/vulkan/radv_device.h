@@ -183,6 +183,11 @@ struct radv_bc250_device_env {
     * from the command buffer's upload buffer, other BC250 scratch from the
     * transient arena also without ONE_TIME_SUBMIT (bc250_alloc_scratch). */
    bool scratch_reuse;
+   /* RADV_BC250_TASK_PERSIST=1: primary command buffers keep a GPU-local
+    * hybrid-Task scratch BO and reuse recorded task_tail IB2 side streams
+    * across draws and command-buffer resets instead of recreating and zeroing
+    * per-draw BOs/IBs on the CPU. */
+   bool task_persist;
    /* RADV_BC250_SPLIT_LEAN_SETUP=1: the per-draw split argument setup binds,
     * pushes and restores only what it touches (bc250_split_setup_dispatch). */
    bool split_lean_setup;

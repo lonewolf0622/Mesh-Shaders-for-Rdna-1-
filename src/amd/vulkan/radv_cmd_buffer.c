@@ -1207,6 +1207,7 @@ radv_destroy_cmd_buffer(struct vk_command_buffer *vk_cmd_buffer)
    struct radv_device *device = radv_cmd_buffer_device(cmd_buffer);
 
    radv_bc250_task_tails_free(cmd_buffer);
+   radv_bc250_task_storage_reset(cmd_buffer, true);
    radv_bc250_idx_storage_reset(cmd_buffer, true);
    if (cmd_buffer->utrace.trace) {
       u_trace_fini(cmd_buffer->utrace.trace);
@@ -1298,6 +1299,10 @@ radv_create_cmd_buffer(struct vk_command_pool *pool, VkCommandBufferLevel level,
       return result;
    }
 
+   util_dynarray_init(&cmd_buffer->bc250_task_tails, NULL);
+   util_dynarray_init(&cmd_buffer->bc250_task_tail_pool, NULL);
+   cmd_buffer->bc250_task_reset_seq = 1;
+
    cmd_buffer->qf = vk_queue_to_radv(pdev, pool->queue_family_index);
 
    if (cmd_buffer->qf != RADV_QUEUE_SPARSE) {
@@ -1359,6 +1364,7 @@ radv_reset_cmd_buffer(struct vk_command_buffer *vk_cmd_buffer, UNUSED VkCommandB
    cmd_buffer->bc250_idx_restore = NULL;
    radv_bc250_idx_storage_reset(cmd_buffer, false);
    radv_bc250_task_tails_free(cmd_buffer);
+   radv_bc250_task_storage_reset(cmd_buffer, false);
    cmd_buffer->bc250_mesh_amd_reuse_off = false;
    cmd_buffer->bc250_mesh_dealloc_dist_set = false;
 
@@ -1520,6 +1526,10 @@ radv_cmd_buffer_upload_alloc_aligned(struct radv_cmd_buffer *cmd_buffer, unsigne
    if (offset + size > cmd_buffer->upload.size) {
       if (cmd_buffer->bc250_dgc_upload_va) {
          vk_command_buffer_set_error(&cmd_buffer->vk, VK_ERROR_FEATURE_NOT_PRESENT);
+         return false;
+      }
+      if (cmd_buffer->bc250_fixed_upload) {
+         cmd_buffer->bc250_fixed_upload = 2;
          return false;
       }
       if (!radv_cmd_buffer_resize_upload_buf(cmd_buffer, size))
@@ -7388,19 +7398,21 @@ radv_upload_graphics_shader_descriptors(struct radv_cmd_buffer *cmd_buffer)
       cmd_buffer->state.dirty &= ~RADV_CMD_DIRTY_STREAMOUT_BUFFER;
    }
 
-   if (descriptors_state->dirty) {
-      radv_flush_descriptors(cmd_buffer, stages, VK_PIPELINE_BIND_POINT_GRAPHICS);
-      descriptors_state->dirty = 0;
-   }
+   if (!cmd_buffer->bc250_inherit_descriptors) {
+      if (descriptors_state->dirty) {
+         radv_flush_descriptors(cmd_buffer, stages, VK_PIPELINE_BIND_POINT_GRAPHICS);
+         descriptors_state->dirty = 0;
+      }
 
-   if (descriptors_state->dirty_heaps) {
-      radv_flush_descriptor_heaps(cmd_buffer, stages, VK_PIPELINE_BIND_POINT_GRAPHICS);
-      descriptors_state->dirty_heaps = 0;
-   }
+      if (descriptors_state->dirty_heaps) {
+         radv_flush_descriptor_heaps(cmd_buffer, stages, VK_PIPELINE_BIND_POINT_GRAPHICS);
+         descriptors_state->dirty_heaps = 0;
+      }
 
-   if (descriptors_state->dirty_dynamic && descriptors_state->dynamic_offset_count) {
-      radv_flush_dynamic_descriptors(cmd_buffer, stages, VK_PIPELINE_BIND_POINT_GRAPHICS);
-      descriptors_state->dirty_dynamic = false;
+      if (descriptors_state->dirty_dynamic && descriptors_state->dynamic_offset_count) {
+         radv_flush_dynamic_descriptors(cmd_buffer, stages, VK_PIPELINE_BIND_POINT_GRAPHICS);
+         descriptors_state->dirty_dynamic = false;
+      }
    }
 
    const VkShaderStageFlags pc_stages = radv_must_flush_constants(cmd_buffer, stages, VK_PIPELINE_BIND_POINT_GRAPHICS);
@@ -8991,6 +9003,8 @@ radv_emit_compute_pipeline(struct radv_cmd_buffer *cmd_buffer, struct radv_compu
 static void
 radv_mark_descriptors_dirty(struct radv_cmd_buffer *cmd_buffer, VkPipelineBindPoint bind_point)
 {
+   if (cmd_buffer->bc250_inherit_descriptors)
+      return;
    struct radv_descriptor_state *descriptors_state = radv_get_descriptors_state(cmd_buffer, bind_point);
 
    descriptors_state->dirty |= descriptors_state->valid;
@@ -14387,19 +14401,21 @@ radv_before_taskmesh_draw(struct radv_cmd_buffer *cmd_buffer, const struct radv_
    struct radv_descriptor_state *descriptors_state =
       radv_get_descriptors_state(cmd_buffer, VK_PIPELINE_BIND_POINT_GRAPHICS);
 
-   if (descriptors_state->dirty) {
-      radv_flush_descriptors(cmd_buffer, stages, VK_PIPELINE_BIND_POINT_GRAPHICS);
-      descriptors_state->dirty = 0;
-   }
+   if (!cmd_buffer->bc250_inherit_descriptors) {
+      if (descriptors_state->dirty) {
+         radv_flush_descriptors(cmd_buffer, stages, VK_PIPELINE_BIND_POINT_GRAPHICS);
+         descriptors_state->dirty = 0;
+      }
 
-   if (descriptors_state->dirty_heaps) {
-      radv_flush_descriptor_heaps(cmd_buffer, stages, VK_PIPELINE_BIND_POINT_GRAPHICS);
-      descriptors_state->dirty_heaps = 0;
-   }
+      if (descriptors_state->dirty_heaps) {
+         radv_flush_descriptor_heaps(cmd_buffer, stages, VK_PIPELINE_BIND_POINT_GRAPHICS);
+         descriptors_state->dirty_heaps = 0;
+      }
 
-   if (descriptors_state->dirty_dynamic && descriptors_state->dynamic_offset_count) {
-      radv_flush_dynamic_descriptors(cmd_buffer, stages, VK_PIPELINE_BIND_POINT_GRAPHICS);
-      descriptors_state->dirty_dynamic = false;
+      if (descriptors_state->dirty_dynamic && descriptors_state->dynamic_offset_count) {
+         radv_flush_dynamic_descriptors(cmd_buffer, stages, VK_PIPELINE_BIND_POINT_GRAPHICS);
+         descriptors_state->dirty_dynamic = false;
+      }
    }
 
    const VkShaderStageFlags pc_stages = radv_must_flush_constants(cmd_buffer, stages, VK_PIPELINE_BIND_POINT_GRAPHICS);
@@ -15563,19 +15579,27 @@ radv_upload_compute_shader_descriptors(struct radv_cmd_buffer *cmd_buffer, VkPip
 {
    struct radv_descriptor_state *descriptors_state = radv_get_descriptors_state(cmd_buffer, bind_point);
 
-   if (descriptors_state->dirty) {
-      radv_flush_descriptors(cmd_buffer, VK_SHADER_STAGE_COMPUTE_BIT, bind_point);
-      descriptors_state->dirty = 0;
-   }
+   /* A cached BC250 task tail executes immediately after chunk 0, which has
+    * already established this draw's live compute descriptors. Meta binding
+    * marks them dirty again while recording the side stream; emitting them
+    * there would bake the first draw's set VAs into a stream reused by later
+    * draws. Inherit sets, heaps, and dynamic descriptors from chunk 0, while
+    * still flushing the tail's private constants below. */
+   if (!cmd_buffer->bc250_inherit_descriptors) {
+      if (descriptors_state->dirty) {
+         radv_flush_descriptors(cmd_buffer, VK_SHADER_STAGE_COMPUTE_BIT, bind_point);
+         descriptors_state->dirty = 0;
+      }
 
-   if (descriptors_state->dirty_heaps) {
-      radv_flush_descriptor_heaps(cmd_buffer, VK_SHADER_STAGE_COMPUTE_BIT, bind_point);
-      descriptors_state->dirty_heaps = 0;
-   }
+      if (descriptors_state->dirty_heaps) {
+         radv_flush_descriptor_heaps(cmd_buffer, VK_SHADER_STAGE_COMPUTE_BIT, bind_point);
+         descriptors_state->dirty_heaps = 0;
+      }
 
-   if (descriptors_state->dirty_dynamic && descriptors_state->dynamic_offset_count) {
-      radv_flush_dynamic_descriptors(cmd_buffer, VK_SHADER_STAGE_COMPUTE_BIT, bind_point);
-      descriptors_state->dirty_dynamic = false;
+      if (descriptors_state->dirty_dynamic && descriptors_state->dynamic_offset_count) {
+         radv_flush_dynamic_descriptors(cmd_buffer, VK_SHADER_STAGE_COMPUTE_BIT, bind_point);
+         descriptors_state->dirty_dynamic = false;
+      }
    }
 
    const VkShaderStageFlags stages =
