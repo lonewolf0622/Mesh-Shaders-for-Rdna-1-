@@ -240,10 +240,6 @@ shaders, and Control was played again with the renumbered export.
 `tests/bc250-mesh/` holds offline suites that run under Mesa's amdgpu noop drm-shim (`AMDGPU_GPU_ID=gfx1013`) without
 touching the GPU. Each suite's README lists its variables (`ICD=`, `BUILD=`, `SHIM=`).
 
-## Credits
-
-- Luckiskind ([github.com/luckiskind](https://github.com/luckiskind)): [bc250-radv-r2](https://github.com/luckiskind/bc250-radv-r2), BC-250 RADV Mesh work referenced during this project.
-
 ## License
 
 DirectMesh's own work is licensed under the GNU General Public License, version 3 or later (GPL-3.0-or-later): see
