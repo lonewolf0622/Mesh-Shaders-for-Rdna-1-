@@ -246,5 +246,14 @@ touching the GPU. Each suite's README lists its variables (`ICD=`, `BUILD=`, `SH
 
 ## License
 
-MIT, like Mesa. See `docs/license.rst`. Mesa 3D and RADV are MIT-licensed; AMD PAL and LLPC sources were used as a
-programming reference for GFX10 NGG.
+DirectMesh's own work is licensed under the GNU General Public License, version 3 or later (GPL-3.0-or-later): see
+`LICENSE`. That covers the Mesh and Task shader code DirectMesh adds to RADV, the patches in `patches/`, the tests in
+`tests/bc250-mesh/`, `install.sh` and DirectMesh's documentation. Anyone who shares a modified version must share its
+source under the same license.
+
+Mesa's own files keep their own licenses, mostly MIT: see each file's SPDX line, `docs/license.rst` and `licenses/`.
+MIT code can be part of a GPL project, so the driver built from this repository can be shared under the GPL-3.0.
+
+Releases up to and including v1.4.1 were published under the MIT license and stay available under it.
+
+AMD PAL and LLPC sources were used as a programming reference for GFX10 NGG.
