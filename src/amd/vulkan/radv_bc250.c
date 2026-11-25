@@ -2232,6 +2232,19 @@ bc250_staging_alias_layout(nir_shader *mesh, const struct radv_bc250_staging_ali
               mesh->info.shared_size, application_size);
 }
 
+static unsigned
+radv_bc250_staging_limit(void)
+{
+   static int limit = -1;
+   if (limit < 0) {
+      const int64_t asked = radv_dm_num("RADV_BC250_STAGING_LIMIT", 28 * 1024);
+      limit = asked >= 28 * 1024 && asked <= 30 * 1024 - 256 ? (int)asked : 28 * 1024;
+      if (getenv("BC250_TRACE_COMPILE"))
+         fprintf(stderr, "BC250 MESH STAGING LIMIT: %d bytes\n", limit);
+   }
+   return limit;
+}
+
 bool
 radv_bc250_expand_primitive_attributes(nir_shader *mesh, nir_shader *fs, bool compact_policy,
                                        bool reclaim_dead_shared, unsigned direct_read, bool *over_budget,
@@ -2342,8 +2355,15 @@ radv_bc250_expand_primitive_attributes(nir_shader *mesh, nir_shader *fs, bool co
        * LDS window, moving its own output storage to the Mesh scratch ring
        * only when it runs out. That ring is not validated on GFX1013, so
        * radv_graphics_shaders_compile refuses expanded shaders that need it.
-       * Hellblade 2's Nanite shaders stage 18.9 KiB (26.5 KiB total LDS). */
-      if (staging_bytes > 28 * 1024)
+       * Hellblade 2's Nanite shaders stage 18.9 KiB (26.5 KiB total LDS).
+       *
+       * For an expanded shader the lowering keeps almost nothing of its own
+       * in LDS (about 128 bytes on top of the staging), so a shader that
+       * stages a little over 28 KiB still fits the window without the ring.
+       * RADV_BC250_STAGING_LIMIT raises the limit for testing. It is held
+       * 256 bytes under the 30 KiB the lowering has when indices or the cull
+       * flag cross invocations, so that it never has to reach for the ring. */
+      if (staging_bytes > radv_bc250_staging_limit())
          over = true;
       source[count++] = var;
       if (var->data.location == VARYING_SLOT_PRIMITIVE_INDICES)

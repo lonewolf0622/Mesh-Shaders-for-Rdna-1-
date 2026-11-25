@@ -106,6 +106,7 @@ DirectMesh is on by default on the supported GPUs. These go in front of `%comman
 - `RADV_BC250_MESH_TASK_IDX=0`: no Task index route (pipelines no Mesh route can take are refused instead).
 - `RADV_BC250_MESH_TASK_IDX_MESH_ONLY=0`: the Task index route only for Task + Mesh pipelines, not Mesh-only ones.
 - `RADV_BC250_MESH_IDXPASS=0`: no indexed Mesh draws.
+- `RADV_BC250_STAGING_LIMIT=<bytes>`: the output staging an expanded Mesh shader may use, 28672 (the default) to 30464. For testing Mesh-only pipelines refused with `required vertex expansion unavailable`.
 - `RADV_DEBUG=nomeshshader`: hide Mesh shaders, so the game uses its non-Mesh path (for comparisons).
 
 ## If a game hangs
