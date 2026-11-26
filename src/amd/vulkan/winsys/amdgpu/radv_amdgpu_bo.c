@@ -390,7 +390,10 @@ radv_amdgpu_winsys_bo_destroy(struct radeon_winsys *_ws, struct radeon_winsys_bo
 
    const uint64_t va_size = radv_amdgpu_bo_va_size(bo->base.size, bo->flags);
    radv_amdgpu_bo_va_op(ws, bo->bo_handle, 0, va_size, bo->base.va, 0, 0, AMDGPU_VA_OP_UNMAP);
-   ac_drm_bo_free(ws->dev, bo->bo);
+   if (bo->bo.abo)
+      ac_drm_bo_free(ws->dev, bo->bo);
+   else if (bo->bo_handle)
+      drmCloseBufferHandle(ws->fd, bo->bo_handle);
 
    if (bo->base.initial_domain & RADEON_DOMAIN_VRAM) {
       if (bo->base.vram_no_cpu_access) {
@@ -838,10 +841,25 @@ radv_amdgpu_winsys_bo_from_ptr(struct radeon_winsys *_ws, void *pointer, uint64_
    if (!bo)
       return VK_ERROR_OUT_OF_HOST_MEMORY;
 
+   memset(&buf_handle, 0, sizeof(buf_handle));
+   uint32_t kms_handle = 0;
+
    ret = ac_drm_create_bo_from_user_mem(ws->dev, pointer, size, &buf_handle);
    if (ret) {
-      result = VK_ERROR_INVALID_EXTERNAL_HANDLE;
-      goto error;
+      /* libdrm hardcodes AMDGPU_GEM_USERPTR_ANONONLY, which rejects shared
+       * file/memfd-backed views (e.g. Wine MapViewOfFile3) with -EPERM even
+       * though amdgpu HMM userptr handles them cleanly. Retry without ANONONLY. */
+      struct drm_amdgpu_gem_userptr uargs;
+      memset(&uargs, 0, sizeof(uargs));
+      uargs.addr = (uintptr_t)pointer;
+      uargs.size = size;
+      uargs.flags = AMDGPU_GEM_USERPTR_VALIDATE | AMDGPU_GEM_USERPTR_REGISTER;
+      ret = drm_ioctl_write_read(ws->fd, DRM_AMDGPU_GEM_USERPTR, &uargs, sizeof(uargs));
+      if (ret) {
+         result = VK_ERROR_INVALID_EXTERNAL_HANDLE;
+         goto error;
+      }
+      kms_handle = uargs.handle;
    }
 
    /* Using the optimal VM alignment also fixes GPU hangs for buffers that
@@ -855,9 +873,10 @@ radv_amdgpu_winsys_bo_from_ptr(struct radeon_winsys *_ws, void *pointer, uint64_
       goto error_va_alloc;
    }
 
-   uint32_t kms_handle = 0;
-   ASSERTED int r = ac_drm_bo_export(ws->dev, buf_handle, amdgpu_bo_handle_type_kms, &kms_handle);
-   assert(!r);
+   if (buf_handle.abo) {
+      ASSERTED int r = ac_drm_bo_export(ws->dev, buf_handle, amdgpu_bo_handle_type_kms, &kms_handle);
+      assert(!r);
+   }
 
    if (radv_amdgpu_bo_va_op(ws, kms_handle, 0, size, va, 0, 0, AMDGPU_VA_OP_MAP)) {
       result = VK_ERROR_UNKNOWN;
@@ -874,7 +893,7 @@ radv_amdgpu_winsys_bo_from_ptr(struct radeon_winsys *_ws, void *pointer, uint64_
    bo->base.use_global_list = false;
    bo->priority = priority;
    bo->cpu_map = NULL;
-   bo->base.obj_id = (uintptr_t)(buf_handle.abo);
+   bo->base.obj_id = buf_handle.abo ? (uintptr_t)(buf_handle.abo) : (uintptr_t)bo;
 
    p_atomic_add(&ws->alloc_tracker->allocated_gtt, align64(bo->base.size, ws->info.gart_page_size));
 
@@ -889,7 +908,10 @@ error_va_map:
    ac_drm_va_range_free(va_handle);
 
 error_va_alloc:
-   ac_drm_bo_free(ws->dev, buf_handle);
+   if (buf_handle.abo)
+      ac_drm_bo_free(ws->dev, buf_handle);
+   else if (kms_handle)
+      drmCloseBufferHandle(ws->fd, kms_handle);
 
 error:
    FREE(bo);
@@ -1006,6 +1028,8 @@ radv_amdgpu_winsys_get_fd(struct radeon_winsys *_ws, struct radeon_winsys_bo *_b
    enum amdgpu_bo_handle_type type = amdgpu_bo_handle_type_dma_buf_fd;
    int r;
    unsigned handle;
+   if (!bo->bo.abo)
+      return false;
    r = ac_drm_bo_export(ws->dev, bo->bo, type, &handle);
    if (r)
       return false;
@@ -1322,6 +1346,19 @@ radv_amdgpu_bo_wait_for_idle(struct radeon_winsys *_ws, struct radeon_winsys_bo 
    struct radv_amdgpu_winsys *ws = radv_amdgpu_winsys(_ws);
    struct radv_amdgpu_winsys_bo *bo = radv_amdgpu_winsys_bo(_bo);
    bool buffer_busy = true;
+
+   if (!bo->bo.abo) {
+      union drm_amdgpu_gem_wait_idle args;
+      memset(&args, 0, sizeof(args));
+      args.in.handle = bo->bo_handle;
+      args.in.timeout = OS_TIMEOUT_INFINITE;
+      int r = drm_ioctl_write_read(ws->fd, DRM_AMDGPU_GEM_WAIT_IDLE, &args, sizeof(args));
+      if (r) {
+         fprintf(stderr, "radv/amdgpu: DRM_AMDGPU_GEM_WAIT_IDLE failed: %d\n", r);
+         return false;
+      }
+      return args.out.status == 0;
+   }
 
    int r = ac_drm_bo_wait_for_idle(ws->dev, bo->bo, OS_TIMEOUT_INFINITE, &buffer_busy);
    if (r)
